@@ -1,0 +1,402 @@
+{
+  "name": "calvin_task_ontology",
+  "benchmark": "CALVIN",
+  "objects": {
+    "drawer": {
+      "class": "drawer",
+      "joints": [
+        "drawer_slide_joint"
+      ],
+      "instances": [
+        "drawer",
+        "drawer_handle",
+        "drawer_front",
+        "drawer_frame"
+      ],
+      "ontology": {
+        "object": {
+          "children": {
+            "drawer_slide_joint": {
+              "description": "linear joint controlling the drawer open or closed state",
+              "state": "continuous",
+              "related_tasks": [
+                "open_drawer",
+                "close_drawer",
+                "push_into_drawer"
+              ],
+              "affordances": [
+                "slidable",
+                "openable",
+                "closable",
+                "pushable",
+                "pullable"
+              ],
+              "effects": {
+                "open_drawer": "drawer moves outward",
+                "close_drawer": "drawer moves inward",
+                "push_into_drawer": "drawer remains available as a target container"
+              },
+              "children": {}
+            },
+            "drawer_handle": {
+              "description": "interaction part used to pull or guide the drawer",
+              "state": "N/A",
+              "related_tasks": [
+                "open_drawer"
+              ],
+              "affordances": [
+                "graspable",
+                "pullable"
+              ],
+              "effects": {},
+              "children": {}
+            },
+            "drawer_front": {
+              "description": "front surface used to push the drawer closed or push objects into it",
+              "state": "N/A",
+              "related_tasks": [
+                "close_drawer",
+                "push_into_drawer"
+              ],
+              "affordances": [
+                "pushable"
+              ],
+              "effects": {},
+              "children": {}
+            }
+          }
+        }
+      }
+    },
+    "led": {
+      "class": "led",
+      "joints": [
+        "led_button_joint"
+      ],
+      "instances": [
+        "green_led",
+        "led_button",
+        "led_light"
+      ],
+      "ontology": {
+        "object": {
+          "children": {
+            "led_button_joint": {
+              "description": "button that toggles the green LED state",
+              "state": "binary",
+              "related_tasks": [
+                "turn_on_led",
+                "turn_off_led"
+              ],
+              "affordances": [
+                "pressable",
+                "toggleable"
+              ],
+              "effects": {
+                "turn_on_led": "green LED becomes on",
+                "turn_off_led": "green LED becomes off"
+              },
+              "children": {}
+            },
+            "led_button_surface": {
+              "description": "small surface pressed by the robot end-effector",
+              "state": "N/A",
+              "related_tasks": [
+                "turn_on_led",
+                "turn_off_led"
+              ],
+              "affordances": [
+                "pressable"
+              ],
+              "effects": {},
+              "children": {}
+            }
+          }
+        }
+      }
+    },
+    "lightbulb": {
+      "class": "lightbulb",
+      "joints": [
+        "lightbulb_switch_joint"
+      ],
+      "instances": [
+        "lightbulb",
+        "lightbulb_switch",
+        "switch"
+      ],
+      "ontology": {
+        "object": {
+          "children": {
+            "lightbulb_switch_joint": {
+              "description": "switch that changes the lightbulb state",
+              "state": "binary",
+              "related_tasks": [
+                "turn_on_lightbulb",
+                "turn_off_lightbulb"
+              ],
+              "affordances": [
+                "pushable",
+                "toggleable"
+              ],
+              "effects": {
+                "turn_on_lightbulb": "lightbulb becomes on",
+                "turn_off_lightbulb": "lightbulb becomes off"
+              },
+              "children": {}
+            },
+            "lightbulb_switch": {
+              "description": "interaction part for changing the lightbulb state",
+              "state": "N/A",
+              "related_tasks": [
+                "turn_on_lightbulb",
+                "turn_off_lightbulb"
+              ],
+              "affordances": [
+                "pushable"
+              ],
+              "effects": {},
+              "children": {}
+            }
+          }
+        }
+      }
+    },
+    "slider": {
+      "class": "slider",
+      "joints": [
+        "slider_joint"
+      ],
+      "instances": [
+        "slider",
+        "slider_handle",
+        "sliding_block"
+      ],
+      "ontology": {
+        "object": {
+          "children": {
+            "slider_joint": {
+              "description": "linear joint for the slider mechanism",
+              "state": "continuous",
+              "related_tasks": [
+                "move_slider_left"
+              ],
+              "affordances": [
+                "slidable",
+                "pushable"
+              ],
+              "effects": {
+                "move_slider_left": "slider moves to the left target state"
+              },
+              "children": {}
+            },
+            "slider_handle": {
+              "description": "part used to push the slider",
+              "state": "N/A",
+              "related_tasks": [
+                "move_slider_left"
+              ],
+              "affordances": [
+                "pushable"
+              ],
+              "effects": {},
+              "children": {}
+            }
+          }
+        }
+      }
+    },
+    "block": {
+      "class": "block",
+      "joints": [],
+      "instances": [
+        "red_block",
+        "blue_block",
+        "pink_block",
+        "movable_block"
+      ],
+      "ontology": {
+        "object": {
+          "children": {
+            "block_body": {
+              "description": "movable object manipulated by pushing or lifting",
+              "state": "free_body",
+              "related_tasks": [
+                "push_into_drawer"
+              ],
+              "affordances": [
+                "pushable",
+                "movable",
+                "placeable"
+              ],
+              "effects": {
+                "push_into_drawer": "block is moved into the drawer"
+              },
+              "children": {}
+            }
+          }
+        }
+      }
+    }
+  },
+  "tasks": {
+    "open_drawer": {
+      "task_key": "open_drawer",
+      "aliases": [
+        "open drawer",
+        "pull drawer",
+        "open the drawer"
+      ],
+      "object": "drawer",
+      "interaction_part": "drawer_handle",
+      "affordances": [
+        "openable",
+        "slidable",
+        "pullable"
+      ],
+      "motion_type": "pull outward until the drawer is open",
+      "success_criteria": "drawer reaches the open state according to the CALVIN task oracle",
+      "future_caption": "a robot arm opens the drawer in the CALVIN scene",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/open_drawer/inpainted_robot_future.mp4"
+    },
+    "close_drawer": {
+      "task_key": "close_drawer",
+      "aliases": [
+        "close drawer",
+        "shut drawer",
+        "push drawer closed"
+      ],
+      "object": "drawer",
+      "interaction_part": "drawer_front",
+      "affordances": [
+        "closable",
+        "slidable",
+        "pushable"
+      ],
+      "motion_type": "push inward until the drawer is closed",
+      "success_criteria": "drawer reaches the closed state according to the CALVIN task oracle",
+      "future_caption": "a robot arm closes the drawer in the CALVIN scene",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/close_drawer/inpainted_robot_future.mp4"
+    },
+    "push_into_drawer": {
+      "task_key": "push_into_drawer",
+      "aliases": [
+        "push into drawer",
+        "push block into drawer",
+        "put block into drawer",
+        "move the block into the drawer"
+      ],
+      "object": "block",
+      "interaction_part": "block_body",
+      "target_object": "drawer",
+      "affordances": [
+        "pushable",
+        "movable",
+        "placeable"
+      ],
+      "motion_type": "push the object into the open drawer",
+      "success_criteria": "the object is inside the drawer according to the CALVIN task oracle",
+      "future_caption": "a robot arm pushes the block into the drawer",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/push_into_drawer/inpainted_robot_future.mp4"
+    },
+    "turn_on_led": {
+      "task_key": "turn_on_led",
+      "aliases": [
+        "turn on led",
+        "turn on the green led",
+        "switch on led",
+        "led on",
+        "green led on"
+      ],
+      "object": "green_led",
+      "interaction_part": "led_button_surface",
+      "affordances": [
+        "pressable",
+        "toggleable"
+      ],
+      "motion_type": "press the LED button",
+      "success_criteria": "green LED is on according to the CALVIN task oracle",
+      "future_caption": "a robot arm presses the green LED button to turn it on",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_on_led/inpainted_robot_future.mp4"
+    },
+    "turn_off_led": {
+      "task_key": "turn_off_led",
+      "aliases": [
+        "turn off led",
+        "turn off the green led",
+        "switch off led",
+        "led off",
+        "green led off"
+      ],
+      "object": "green_led",
+      "interaction_part": "led_button_surface",
+      "affordances": [
+        "pressable",
+        "toggleable"
+      ],
+      "motion_type": "press the LED button",
+      "success_criteria": "green LED is off according to the CALVIN task oracle",
+      "future_caption": "a robot arm presses the green LED button to turn it off",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_off_led/inpainted_robot_future.mp4"
+    },
+    "turn_on_lightbulb": {
+      "task_key": "turn_on_lightbulb",
+      "aliases": [
+        "turn on lightbulb",
+        "turn on the lightbulb",
+        "switch on lightbulb",
+        "turn on bulb",
+        "lightbulb on"
+      ],
+      "object": "lightbulb",
+      "interaction_part": "lightbulb_switch",
+      "affordances": [
+        "pushable",
+        "toggleable"
+      ],
+      "motion_type": "move the switch toward the on state",
+      "success_criteria": "lightbulb is on according to the CALVIN task oracle",
+      "future_caption": "a robot arm moves the lightbulb switch to turn it on",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_on_lightbulb/inpainted_robot_future.mp4"
+    },
+    "turn_off_lightbulb": {
+      "task_key": "turn_off_lightbulb",
+      "aliases": [
+        "turn off lightbulb",
+        "turn off the lightbulb",
+        "switch off lightbulb",
+        "turn off bulb",
+        "lightbulb off"
+      ],
+      "object": "lightbulb",
+      "interaction_part": "lightbulb_switch",
+      "affordances": [
+        "pushable",
+        "toggleable"
+      ],
+      "motion_type": "move the switch toward the off state",
+      "success_criteria": "lightbulb is off according to the CALVIN task oracle",
+      "future_caption": "a robot arm moves the lightbulb switch to turn it off",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_off_lightbulb/inpainted_robot_future.mp4"
+    },
+    "move_slider_left": {
+      "task_key": "move_slider_left",
+      "aliases": [
+        "move slider left",
+        "slide left",
+        "move the slider left",
+        "push slider left"
+      ],
+      "object": "slider",
+      "interaction_part": "slider_handle",
+      "affordances": [
+        "slidable",
+        "pushable"
+      ],
+      "motion_type": "push the slider left",
+      "success_criteria": "slider reaches the left target state according to the CALVIN task oracle",
+      "future_caption": "a robot arm pushes the slider to the left",
+      "future_video_path": "/path/to/generated_inpainted_calvin_futures/move_slider_left/inpainted_robot_future.mp4"
+    }
+  }
+}

@@ -1,0 +1,705 @@
+import numpy as np
+if not hasattr(np, "int"):
+    np.int = int
+if not hasattr(np, "float"):
+    np.float = float
+if not hasattr(np, "bool"):
+    np.bool = bool
+if not hasattr(np, "object"):
+    np.object = object
+
+import json
+import os
+import random
+import re
+import yaml
+from collections import OrderedDict, deque
+from pathlib import Path
+
+import cv2
+import hydra
+import pybullet as p
+import torch
+import torch.nn as nn
+from omegaconf import OmegaConf
+from torchvision.models import ResNet18_Weights, resnet18
+
+try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
+
+try:
+    import openai
+except Exception:
+    openai = None
+
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "****")
+CALVIN_ROOT = Path("/path/to/calvin")
+DATA_ROOT = CALVIN_ROOT / "dataset/task_D_D/training"
+OUT_BASE = Path("/path/to/enact_calvin_outputs")
+SEGMENTS_JSON = OUT_BASE / "calvin" / "segments_future_bc.json"
+BC_CKPT_PATH = OUT_BASE / "calvin_bc" / "bc_actor_best.pt"
+FINE_TUNING_ACTOR_PATH = OUT_BASE / "calvin_fine_tuning_rl" / "fine_tuning_actor_best.pt"
+FUTURE_VIDEO_ROOT = Path("/path/to/generated_inpainted_calvin_futures")
+ONTOLOGY_PATH = OUT_BASE / "ontology" / "calvin_task_ontology.json"
+OUTPUT_DIR = OUT_BASE / "llm_future_policy_runs"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
+SHOW_GUI = True
+SAVE_VIDEO = True
+VIDEO_FPS = 12
+IMAGE_SIZE = None
+NUM_EPISODES = 3
+MAX_EPISODE_STEPS = 150
+ARM_ACTION_DIM = 6
+ACTION_DIM = ARM_ACTION_DIM + 1
+TRAIN_SPLIT = 0.90
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1)
+_EP_RE = re.compile(r"episode_(\d+)\.npz$")
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def patch_yaml_tags_for_omegaconf():
+    try:
+        yaml.SafeLoader.add_constructor("!tuple", lambda loader, node: tuple(loader.construct_sequence(node)))
+    except Exception:
+        pass
+
+
+def compose_cfg():
+    conf_path = DATA_ROOT / ".hydra" / "merged_config.yaml"
+    if not conf_path.exists():
+        raise FileNotFoundError("Could not find merged_config at {}".format(conf_path))
+    patch_yaml_tags_for_omegaconf()
+    return OmegaConf.load(conf_path)
+
+
+def make_env(show_gui):
+    cfg = compose_cfg()
+    try:
+        OmegaConf.set_struct(cfg, False)
+        cfg.env.show_gui = bool(show_gui)
+        cfg.env.use_egl = False
+        cfg.env.use_scene_info = True
+    except Exception:
+        pass
+    try:
+        p.disconnect()
+    except Exception:
+        pass
+    env = hydra.utils.instantiate(cfg.env)
+    tasks_oracle = hydra.utils.instantiate(cfg.tasks)
+    return env, tasks_oracle
+
+
+def oracle_success(tasks_oracle, start_info, curr_info, task_key):
+    ti = tasks_oracle.get_task_info(start_info, curr_info)
+    if isinstance(ti, dict):
+        return bool(ti.get(task_key, False))
+    try:
+        return task_key in ti
+    except Exception:
+        return False
+
+
+def build_episode_file_map(data_root):
+    files = sorted(data_root.glob("episode_*.npz"))
+    out = {}
+    for pth in files:
+        m = _EP_RE.search(pth.name)
+        if m is not None:
+            out[int(m.group(1))] = pth
+    if len(out) == 0:
+        raise RuntimeError("No episode files found in {}".format(data_root))
+    return out
+
+
+class EpisodeCache(object):
+    def __init__(self, data_root, max_items=2048):
+        self.episode_file_map = build_episode_file_map(data_root)
+        self.cache = OrderedDict()
+        self.max_items = int(max_items)
+
+    def get(self, idx):
+        idx = int(idx)
+        if idx in self.cache:
+            self.cache.move_to_end(idx)
+            return self.cache[idx]
+        if idx not in self.episode_file_map:
+            raise KeyError("Episode index {} not found".format(idx))
+        data = np.load(str(self.episode_file_map[idx]), allow_pickle=True)
+        item = {k: data[k] for k in data.files}
+        self.cache[idx] = item
+        if len(self.cache) > self.max_items:
+            self.cache.popitem(last=False)
+        return item
+
+
+def load_segments(path):
+    if not path.exists():
+        raise FileNotFoundError("Missing segments json: {}".format(path))
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    return obj["segments"], obj["tasks"], obj.get("task_to_id", {t: i for i, t in enumerate(obj["tasks"])})
+
+
+def split_segments(segments, train_split, seed):
+    ids = np.arange(len(segments))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(ids)
+    n_train = max(1, int(round(len(ids) * train_split)))
+    n_train = min(n_train, len(ids) - 1) if len(ids) > 1 else 1
+    return [segments[int(i)] for i in ids[:n_train]], [segments[int(i)] for i in ids[n_train:]] if len(ids) > 1 else [segments[0]]
+
+
+def get_u8(obs, key):
+    if isinstance(obs, dict) and key in obs:
+        return np.asarray(obs[key], dtype=np.uint8)
+    if isinstance(obs, dict) and "rgb_obs" in obs and key in obs["rgb_obs"]:
+        return np.asarray(obs["rgb_obs"][key], dtype=np.uint8)
+    raise KeyError("Could not find '{}' in observation".format(key))
+
+
+def resize_if_needed(img, image_size=None):
+    if image_size is None:
+        return img
+    return cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_AREA)
+
+
+def read_future_video(path, count, image_size=None):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError("generated future video not found: {}".format(path))
+    cap = cv2.VideoCapture(str(path))
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if image_size is not None:
+            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+        frames.append(frame.astype(np.uint8))
+    cap.release()
+    if len(frames) == 0:
+        raise RuntimeError("empty future video: {}".format(path))
+    ids = np.linspace(0, len(frames) - 1, num=count)
+    ids = np.rint(ids).astype(np.int32)
+    return np.stack([frames[int(i)] for i in ids], axis=0)
+
+
+def write_video(frames, path, fps):
+    if imageio is None or len(frames) == 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(str(path), frames, fps=fps, macro_block_size=1)
+
+
+def short_state(obs, info=None):
+    state = {
+        "robot_obs": np.asarray(obs.get("robot_obs", []), dtype=np.float32).round(4).tolist() if isinstance(obs, dict) else [],
+        "scene_obs": np.asarray(obs.get("scene_obs", []), dtype=np.float32).round(4).tolist() if isinstance(obs, dict) else [],
+    }
+    if info is not None:
+        state["env_info_keys"] = list(info.keys()) if isinstance(info, dict) else []
+    return state
+
+
+
+def load_ontology(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError("ontology json not found: {}".format(path))
+    with open(path, "r", encoding="utf-8") as f:
+        ontology = json.load(f)
+    return ontology
+
+
+def ontology_tasks(ontology):
+    raw = ontology.get("tasks", ontology.get("calvin_tasks", {}))
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        out = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("task_key") or item.get("calvin_task") or item.get("name")
+            if key:
+                out[str(key)] = item
+        return out
+    return {}
+
+
+def task_aliases(task_key, meta):
+    aliases = [task_key.replace("_", " ")]
+    for key in ["aliases", "language", "commands", "instructions", "related_commands"]:
+        vals = meta.get(key, []) if isinstance(meta, dict) else []
+        if isinstance(vals, str):
+            vals = [vals]
+        for v in vals:
+            v = str(v).strip()
+            if v:
+                aliases.append(v)
+    return aliases
+
+
+def pick_task_from_ontology(command, tasks, ontology):
+    q = command.lower().replace("-", " ").replace("_", " ")
+    task_meta = ontology_tasks(ontology)
+    allowed = set(tasks)
+    best_task = None
+    best_score = -1
+
+    for task, meta in task_meta.items():
+        if task not in allowed:
+            continue
+        score = 0
+        for alias in task_aliases(task, meta):
+            a = alias.lower().replace("-", " ").replace("_", " ")
+            if a and a in q:
+                score = max(score, len(a.split()))
+        for word in str(meta.get("object", "")).lower().split():
+            if word and word in q:
+                score += 1
+        for word in str(meta.get("motion_type", "")).lower().split():
+            if word and word in q:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_task = task
+
+    if best_task is not None:
+        return best_task
+
+    ontology_allowed = [t for t in task_meta.keys() if t in allowed]
+    if ontology_allowed:
+        return ontology_allowed[0]
+    return tasks[0]
+
+
+def fallback_plan(command, tasks, ontology):
+    task = pick_task_from_ontology(command, tasks, ontology)
+    meta = ontology_tasks(ontology).get(task, {})
+    return {
+        "task_key": task,
+        "selected_object": meta.get("object", meta.get("target_object", "")),
+        "interaction_part": meta.get("interaction_part", meta.get("part", "")),
+        "motion_type": meta.get("motion_type", meta.get("motion", "")),
+        "future_caption": meta.get("future_caption", "a robot arm completing the task: {}".format(command)),
+        "generated_video_path": meta.get("future_video_path", meta.get("generated_video_path", str(FUTURE_VIDEO_ROOT / task / "inpainted_robot_future.mp4"))),
+        "success_criteria": meta.get("success_criteria", "CALVIN oracle reports task success"),
+        "reasoning": "matched the command to the ontology entry",
+    }
+
+
+def query_llm_for_task(command, tasks, obs_state, ontology):
+    fallback = fallback_plan(command, tasks, ontology)
+    task_meta = ontology_tasks(ontology)
+
+    if OPENAI_API_KEY == "****" or openai is None:
+        return fallback
+
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    client = openai.OpenAI()
+
+    ontology_view = {
+        "name": ontology.get("name", "calvin_ontology"),
+        "benchmark": ontology.get("benchmark", "CALVIN"),
+        "tasks": {t: task_meta.get(t, {}) for t in tasks if t in task_meta},
+    }
+
+    system_prompt = """
+Map the CALVIN command to one ontology task.
+Use only the provided ontology.
+Return valid JSON only.
+""".strip()
+
+    user_prompt = {
+        "command": command,
+        "ontology": ontology_view,
+        "state": obs_state,
+        "return_fields": [
+            "task_key",
+            "selected_object",
+            "interaction_part",
+            "motion_type",
+            "future_caption",
+            "generated_video_path",
+            "success_criteria",
+            "reasoning",
+        ],
+    }
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_prompt, indent=2)},
+            ],
+            temperature=0.0,
+        )
+        text = resp.choices[0].message.content.strip()
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0].strip()
+
+        plan = json.loads(text)
+        if plan.get("task_key") not in tasks:
+            plan["task_key"] = fallback["task_key"]
+
+        meta = task_meta.get(plan["task_key"], {})
+        plan.setdefault("selected_object", meta.get("object", meta.get("target_object", "")))
+        plan.setdefault("interaction_part", meta.get("interaction_part", meta.get("part", "")))
+        plan.setdefault("motion_type", meta.get("motion_type", meta.get("motion", "")))
+        plan.setdefault("future_caption", meta.get("future_caption", fallback["future_caption"]))
+        plan.setdefault("success_criteria", meta.get("success_criteria", fallback["success_criteria"]))
+        plan.setdefault("generated_video_path", meta.get("future_video_path", fallback["generated_video_path"]))
+        return plan
+    except Exception as exc:
+        fallback["reasoning"] = "matched the command to the ontology entry"
+        return fallback
+
+
+class ResNet18Encoder(nn.Module):
+    def __init__(self, pretrained=True):
+        super().__init__()
+        weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        model = resnet18(weights=weights)
+        self.feature_extractor = nn.Sequential(*list(model.children())[:-1])
+        self.out_dim = 512
+
+    def forward(self, x):
+        return self.feature_extractor(x).flatten(1)
+
+
+class FutureBC(nn.Module):
+    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True):
+        super().__init__()
+        self.arm_dim = int(arm_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        self.obs_horizon = int(obs_horizon)
+        self.future_horizon = int(future_horizon)
+        self.num_tasks = int(num_tasks)
+        self.image_encoder = ResNet18Encoder(pretrained=pretrained_backbone)
+        self.image_proj = nn.Linear(self.image_encoder.out_dim, hidden_dim)
+        self.task_emb = nn.Embedding(num_tasks, hidden_dim)
+        self.goal_emb = nn.Embedding(4, hidden_dim)
+        self.action_queries = nn.Parameter(torch.zeros(1, self.chunk_horizon, hidden_dim))
+        nn.init.normal_(self.action_queries, std=0.02)
+        total_tokens = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon + self.future_horizon
+        self.pos_emb = nn.Parameter(torch.zeros(1, total_tokens, hidden_dim))
+        nn.init.normal_(self.pos_emb, std=0.02)
+        self.modality_emb = nn.Embedding(6, hidden_dim)
+        enc_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * ff_mult, dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.arm_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden_dim, self.arm_dim))
+        self.gripper_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden_dim, 1))
+
+    def encode_frames(self, frames_u8):
+        b, t, h, w, c = frames_u8.shape
+        x = frames_u8.float() / 255.0
+        x = x.permute(0, 1, 4, 2, 3).contiguous()
+        x = (x - IMAGENET_MEAN.to(x.device)) / IMAGENET_STD.to(x.device)
+        x = x.view(b * t, c, h, w)
+        return self.image_proj(self.image_encoder(x)).view(b, t, -1)
+
+    def encode_tokens(self, obs_static, obs_gripper, future_static, task_id, goal_type):
+        bsz = obs_static.shape[0]
+        tok_actions = self.action_queries.expand(bsz, -1, -1)
+        tok_task = self.task_emb(task_id).unsqueeze(1)
+        tok_goal = self.goal_emb(goal_type).unsqueeze(1)
+        tok_static = self.encode_frames(obs_static)
+        tok_gripper = self.encode_frames(obs_gripper)
+        tok_future = self.encode_frames(future_static)
+        x = torch.cat([tok_actions, tok_task, tok_goal, tok_static, tok_gripper, tok_future], dim=1)
+        token_types = ([0] * self.chunk_horizon + [1] + [2] + [3] * self.obs_horizon + [4] * self.obs_horizon + [5] * self.future_horizon)
+        token_types = torch.tensor(token_types, dtype=torch.long, device=x.device).unsqueeze(0).expand(bsz, -1)
+        x = x + self.modality_emb(token_types) + self.pos_emb[:, :x.shape[1], :]
+        x = self.transformer(self.input_norm(x))
+        return self.output_norm(x[:, :self.chunk_horizon])
+
+    def forward_with_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
+        z = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
+        return z, self.arm_head(z), self.gripper_head(z).squeeze(-1)
+
+
+class FrozenBCPolicy(object):
+    def __init__(self, ckpt_path, device):
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        cfg = ckpt["config"]
+        self.device = device
+        self.tasks = list(cfg["tasks"])
+        self.task_to_id = {t: i for i, t in enumerate(self.tasks)}
+        self.arm_dim = int(cfg["arm_dim"])
+        self.chunk_horizon = int(cfg["chunk_horizon"])
+        self.obs_horizon = int(cfg["obs_horizon"])
+        self.future_horizon = int(cfg["future_horizon"])
+        self.arm_action_mean = np.asarray(ckpt["arm_action_mean"], dtype=np.float32)
+        self.arm_action_std = np.asarray(ckpt["arm_action_std"], dtype=np.float32)
+        self.model = FutureBC(
+            arm_dim=self.arm_dim,
+            chunk_horizon=self.chunk_horizon,
+            obs_horizon=self.obs_horizon,
+            future_horizon=self.future_horizon,
+            num_tasks=int(cfg["num_tasks"]),
+            hidden_dim=int(cfg["hidden_dim"]),
+            num_layers=int(cfg["num_layers"]),
+            num_heads=int(cfg["num_heads"]),
+            dropout=float(cfg["dropout"]),
+            ff_mult=int(cfg["ff_mult"]),
+            pretrained_backbone=True,
+        )
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model.to(device).eval()
+        for pth in self.model.parameters():
+            pth.requires_grad = False
+
+    def extract(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
+        task_id = int(self.task_to_id[task_name])
+        obs_static_t = torch.from_numpy(obs_static).unsqueeze(0).to(self.device)
+        obs_gripper_t = torch.from_numpy(obs_gripper).unsqueeze(0).to(self.device)
+        future_static_t = torch.from_numpy(future_static).unsqueeze(0).to(self.device)
+        task_t = torch.tensor([task_id], dtype=torch.long, device=self.device)
+        goal_t = torch.tensor([int(goal_type)], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            z, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
+        z = z[0]
+        feat = torch.cat([z[0], z.mean(dim=0)], dim=-1).cpu().numpy().astype(np.float32)
+        arm_chunk_n = arm_chunk_n[0].cpu().numpy().astype(np.float32)
+        arm_chunk = arm_chunk_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
+        base_grip = 1.0 if float(torch.sigmoid(grip_logits[0, 0]).item()) > 0.5 else -1.0
+        return {"feature": feat, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+
+
+class FineTuningActor(nn.Module):
+    def __init__(self, feature_dim, action_dim, arm_dim, arm_limit, grip_limit):
+        super().__init__()
+        self.register_buffer("limit_vec", torch.tensor([arm_limit] * arm_dim + [grip_limit], dtype=torch.float32).view(1, -1))
+        self.net = nn.Sequential(
+            nn.Linear(int(feature_dim) + int(action_dim), 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
+            nn.Linear(512, 512), nn.ReLU(inplace=True),
+            nn.Linear(512, 256), nn.ReLU(inplace=True),
+            nn.Linear(256, action_dim),
+        )
+
+    def forward(self, feature, base_action):
+        x = torch.cat([feature, base_action], dim=-1)
+        return torch.tanh(self.net(x)) * self.limit_vec.to(x.device)
+
+
+class FineTuningActorWrapper(object):
+    def __init__(self, ckpt_path, device):
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        self.device = device
+        self.feature_dim = int(ckpt["feature_dim"])
+        self.action_dim = int(ckpt.get("action_dim", ACTION_DIM))
+        self.arm_dim = int(ckpt.get("arm_dim", ARM_ACTION_DIM))
+        self.arm_limit = float(ckpt.get("delta_arm_limit", 0.10))
+        self.grip_limit = float(ckpt.get("grip_delta_limit", 2.0))
+        self.actor = FineTuningActor(self.feature_dim, self.action_dim, self.arm_dim, self.arm_limit, self.grip_limit).to(device)
+        self.actor.load_state_dict(ckpt["actor_state_dict"])
+        self.actor.eval()
+        self.limit_vec_np = np.asarray([self.arm_limit] * self.arm_dim + [self.grip_limit], dtype=np.float32)
+
+    def act(self, feature_np, base_action_np):
+        feature = torch.from_numpy(feature_np).unsqueeze(0).to(self.device)
+        base_action = torch.from_numpy(base_action_np).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            delta = self.actor(feature, base_action)[0].cpu().numpy()
+        return np.clip(delta, -self.limit_vec_np, self.limit_vec_np).astype(np.float32)
+
+
+class LLMFuturePolicyRunner(object):
+    def __init__(self, segments, base_policy, fine_tuning_actor, cache, plan):
+        self.segments = list(segments)
+        self.base_policy = base_policy
+        self.fine_tuning_actor = fine_tuning_actor
+        self.cache = cache
+        self.plan = plan
+        self.task = plan["task_key"]
+        self.env = None
+        self.tasks_oracle = None
+        self.current_segment = None
+        self.start_info = None
+        self.obs_static_hist = deque(maxlen=base_policy.obs_horizon)
+        self.obs_gripper_hist = deque(maxlen=base_policy.obs_horizon)
+        self.last_obs = None
+        self.future_static = read_future_video(plan["generated_video_path"], base_policy.future_horizon, IMAGE_SIZE)
+
+    def _ensure_env(self):
+        if self.env is None:
+            self.env, self.tasks_oracle = make_env(SHOW_GUI)
+
+    def _segment_for_task(self, episode_id):
+        candidates = [s for s in self.segments if s["task"] == self.task]
+        if len(candidates) == 0:
+            raise RuntimeError("No eval segments found for task {}".format(self.task))
+        return candidates[episode_id % len(candidates)]
+
+    def reset(self, episode_id):
+        self._ensure_env()
+        self.current_segment = self._segment_for_task(episode_id)
+        start_idx = int(self.current_segment["global_start_idx"])
+        item = self.cache.get(start_idx)
+        obs = self.env.reset(robot_obs=np.asarray(item["robot_obs"], dtype=np.float32), scene_obs=np.asarray(item["scene_obs"], dtype=np.float32))
+        self.start_info = self.env.get_info()
+        self.last_obs = obs
+        self.obs_static_hist.clear()
+        self.obs_gripper_hist.clear()
+        init_static = resize_if_needed(get_u8(obs, "rgb_static"), IMAGE_SIZE)
+        init_gripper = resize_if_needed(get_u8(obs, "rgb_gripper"), IMAGE_SIZE)
+        for _ in range(self.base_policy.obs_horizon):
+            self.obs_static_hist.append(init_static.copy())
+            self.obs_gripper_hist.append(init_gripper.copy())
+        return self._policy_input(), {"task": self.task, "segment_id": int(self.current_segment["segment_id"])}
+
+    def _policy_input(self):
+        return {
+            "obs_static": np.stack(list(self.obs_static_hist), axis=0).astype(np.uint8),
+            "obs_gripper": np.stack(list(self.obs_gripper_hist), axis=0).astype(np.uint8),
+            "future_static": self.future_static.astype(np.uint8),
+            "task": self.task,
+            "goal_type": 3,
+        }
+
+    def compose_action(self, base_action, delta_action):
+        arm = np.clip(base_action[:ARM_ACTION_DIM] + delta_action[:ARM_ACTION_DIM], -1.0, 1.0).astype(np.float32)
+        grip_score = float(base_action[ARM_ACTION_DIM] + delta_action[ARM_ACTION_DIM])
+        grip = 1.0 if grip_score >= 0.0 else -1.0
+        return np.concatenate([arm, np.asarray([grip], dtype=np.float32)], axis=0).astype(np.float32)
+
+    def step(self, action):
+        step_res = self.env.step(np.asarray(action, dtype=np.float32))
+        if len(step_res) == 5:
+            obs, _, terminated_raw, truncated_raw, _ = step_res
+            env_done = bool(terminated_raw) or bool(truncated_raw)
+        else:
+            obs, _, env_done, _ = step_res
+        self.last_obs = obs
+        self.obs_static_hist.append(resize_if_needed(get_u8(obs, "rgb_static"), IMAGE_SIZE))
+        self.obs_gripper_hist.append(resize_if_needed(get_u8(obs, "rgb_gripper"), IMAGE_SIZE))
+        curr_info = self.env.get_info()
+        success = oracle_success(self.tasks_oracle, self.start_info, curr_info, self.task)
+        return self._policy_input(), bool(success), bool(env_done), {"success": bool(success), "task": self.task, "segment_id": int(self.current_segment["segment_id"])}
+
+    def frame(self):
+        if self.last_obs is None:
+            return None
+        return resize_if_needed(get_u8(self.last_obs, "rgb_static"), IMAGE_SIZE).copy()
+
+    def close(self):
+        try:
+            if self.env is not None:
+                self.env.close()
+        except Exception:
+            pass
+        self.env = None
+
+
+def to_base_action(base):
+    return np.concatenate([base["base_arm"][:ARM_ACTION_DIM], np.asarray([base["base_grip"]], dtype=np.float32)], axis=0).astype(np.float32)
+
+
+def main():
+    set_seed(SEED)
+    ensure_dir(OUTPUT_DIR)
+    os.chdir(CALVIN_ROOT)
+    os.environ["CALVIN_ROOT"] = str(CALVIN_ROOT)
+
+    segments, tasks, _ = load_segments(SEGMENTS_JSON)
+    ontology = load_ontology(ONTOLOGY_PATH)
+    _, eval_segments = split_segments(segments, TRAIN_SPLIT, SEED)
+    cache = EpisodeCache(DATA_ROOT)
+    base_policy = FrozenBCPolicy(BC_CKPT_PATH, DEVICE)
+    fine_tuning_actor = FineTuningActorWrapper(FINE_TUNING_ACTOR_PATH, DEVICE)
+
+    command = input("command> ").strip()
+
+    env0, _ = make_env(False)
+    first_seg = eval_segments[0]
+    item = cache.get(int(first_seg["global_start_idx"]))
+    obs0 = env0.reset(robot_obs=np.asarray(item["robot_obs"], dtype=np.float32), scene_obs=np.asarray(item["scene_obs"], dtype=np.float32))
+    state_for_llm = short_state(obs0, env0.get_info())
+    try:
+        env0.close()
+    except Exception:
+        pass
+
+    plan = query_llm_for_task(command, tasks, state_for_llm, ontology)
+    plan_path = OUTPUT_DIR / "llm_plan.json"
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump({"command": command, "ontology_path": str(ONTOLOGY_PATH), "plan": plan}, f, indent=2)
+
+    print("task:", plan["task_key"])
+    print("future:", plan["generated_video_path"])
+
+    runner = LLMFuturePolicyRunner(eval_segments, base_policy, fine_tuning_actor, cache, plan)
+    results = []
+    try:
+        for ep in range(NUM_EPISODES):
+            pi, info = runner.reset(ep)
+            frames = []
+            fr = runner.frame()
+            if fr is not None:
+                frames.append(fr)
+            success = False
+            env_done = False
+            steps = 0
+            last_info = info
+            while not success and not env_done and steps < MAX_EPISODE_STEPS:
+                base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
+                base_action = to_base_action(base)
+                delta = fine_tuning_actor.act(base["feature"], base_action)
+                action = runner.compose_action(base_action, delta)
+                pi, success, env_done, last_info = runner.step(action)
+                steps += 1
+                fr = runner.frame()
+                if fr is not None:
+                    frames.append(fr)
+            row = {"episode": ep + 1, "task": plan["task_key"], "success": bool(success), "steps": int(steps), "segment_id": int(last_info.get("segment_id", -1))}
+            results.append(row)
+            print("ep {:02d} task={} success={} steps={}".format(ep + 1, plan["task_key"], success, steps))
+            if SAVE_VIDEO and len(frames) > 0:
+                write_video(frames, OUTPUT_DIR / "episode_{:02d}_{}.mp4".format(ep + 1, plan["task_key"]), VIDEO_FPS)
+    finally:
+        runner.close()
+        try:
+            p.disconnect()
+        except Exception:
+            pass
+
+    summary = {
+        "command": command,
+        "ontology_path": str(ONTOLOGY_PATH),
+        "plan": plan,
+        "num_episodes": NUM_EPISODES,
+        "success_rate": float(sum(int(r["success"]) for r in results) / max(len(results), 1)),
+        "results": results,
+    }
+    with open(OUTPUT_DIR / "run_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print("saved:", OUTPUT_DIR / "run_summary.json")
+
+
+if __name__ == "__main__":
+    main()
