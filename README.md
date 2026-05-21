@@ -56,11 +56,16 @@ The RoboCasa scripts, generated futures, and trained models are part of the same
 
 ## Setup
 
-Install CALVIN separately, then edit the placeholder paths in the scripts:
+Install CALVIN separately, then configure paths with environment variables:
 
-    CALVIN_ROOT = Path("/path/to/calvin")
-    OUT_BASE = Path("/path/to/enact_calvin_outputs")
-    FUTURE_VIDEO_ROOT = Path("/path/to/generated_inpainted_calvin_futures")
+    export CALVIN_ROOT=<calvin-root>
+    export ENACT_CALVIN_OUT_BASE=<enact-calvin-outputs>
+    export CALVIN_GENERATED_FUTURE_ROOT=<generated-inpainted-calvin-futures>
+
+`CALVIN_DATA_ROOT`, `CALVIN_SEGMENTS_JSON`, `CALVIN_BC_CKPT_PATH`,
+`CALVIN_RESULTS_ROOT`, and `CALVIN_FINE_TUNING_ACTOR_PATH` can override
+individual inputs when needed. If `ENACT_CALVIN_OUT_BASE` is not set, scripts
+write to the repo-local `outputs/` directory.
 
 Install dependencies:
 
@@ -86,6 +91,11 @@ Fine-tune with RL:
 
     python scripts/calvin_train_fine_tuning_rl.py
 
+By default the RL fine-tuning run is multitask and saves checkpoints under:
+
+    outputs/rafc_rl_runs/multitask_step6_rafc_td3bc_seed42/policy_best.pt
+    outputs/rafc_rl_runs/multitask_step6_rafc_td3bc_seed42/policy_final.pt
+
 Use generated futures and/or disable RAFC for baseline checkpoints:
 
     CALVIN_USE_GENERATED_FUTURES_DURING_RL=1 python scripts/calvin_train_fine_tuning_rl.py
@@ -103,7 +113,7 @@ For RAFC ablations, inference accepts simple environment switches:
 
     CALVIN_FUTURE_MODE=null python scripts/calvin_infer_llm_future_bc_rl.py
     CALVIN_FUTURE_MODE=shift CALVIN_FUTURE_SHIFT=4 python scripts/calvin_infer_llm_future_bc_rl.py
-    CALVIN_FUTURE_MODE=wrong CALVIN_WRONG_FUTURE_VIDEO_PATH=/path/to/wrong_future.mp4 python scripts/calvin_infer_llm_future_bc_rl.py
+    CALVIN_FUTURE_MODE=wrong CALVIN_WRONG_FUTURE_VIDEO_PATH=<wrong-future-video.mp4> python scripts/calvin_infer_llm_future_bc_rl.py
 
 ## Notes
 

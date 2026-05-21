@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from pathlib import Path
 
@@ -11,7 +12,19 @@ import zarr
 from torchvision.models import ResNet18_Weights, resnet18
 
 
-OUT_BASE = Path("/path/to/enact_calvin_outputs")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def env_path(name, default=None):
+    value = os.environ.get(name)
+    if value:
+        return Path(value).expanduser()
+    if default is None:
+        return None
+    return Path(default).expanduser()
+
+
+OUT_BASE = env_path("ENACT_CALVIN_OUT_BASE", REPO_ROOT / "outputs")
 DATASET_DIR = OUT_BASE / "calvin"
 ZARR_PATH = DATASET_DIR / "training_dataset_future_bc.zarr"
 OUT_DIR = OUT_BASE / "calvin_bc"

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -19,9 +20,24 @@ TASKS = [
     "move_slider_left",
 ]
 
-CALVIN_ROOT = Path("/path/to/calvin")
-DATA_ROOT = CALVIN_ROOT / "dataset/task_D_D/training"
-OUT_BASE = Path("/path/to/enact_calvin_outputs")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def env_path(name, default=None):
+    value = os.environ.get(name)
+    if value:
+        return Path(value).expanduser()
+    if default is None:
+        return None
+    return Path(default).expanduser()
+
+
+CALVIN_ROOT = env_path("CALVIN_ROOT")
+DATA_ROOT = env_path(
+    "CALVIN_DATA_ROOT",
+    CALVIN_ROOT / "dataset/task_D_D/training" if CALVIN_ROOT is not None else None,
+)
+OUT_BASE = env_path("ENACT_CALVIN_OUT_BASE", REPO_ROOT / "outputs")
 OUT_DIR = OUT_BASE / "calvin"
 OUT_ZARR = OUT_DIR / "training_dataset_future_bc.zarr"
 OUT_SEGMENTS = OUT_DIR / "segments_future_bc.json"
@@ -194,6 +210,8 @@ def flush_batch(start_row, batch, arrays):
 
 def main():
     ensure_dir(OUT_DIR)
+    if DATA_ROOT is None:
+        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before building the CALVIN BC dataset")
     if not DATA_ROOT.exists():
         raise FileNotFoundError("DATA_ROOT not found: {}".format(DATA_ROOT))
 
@@ -230,7 +248,7 @@ def main():
     z = zarr.open(str(OUT_ZARR), mode="w")
     z.attrs["tasks"] = TASKS
     z.attrs["task_to_id"] = task_to_id
-    z.attrs["calvin_root"] = str(CALVIN_ROOT)
+    z.attrs["calvin_root"] = str(CALVIN_ROOT) if CALVIN_ROOT is not None else ""
     z.attrs["data_root"] = str(DATA_ROOT)
     z.attrs["obs_horizon"] = OBS_HORIZON
     z.attrs["num_future_frames"] = NUM_FUTURE_FRAMES

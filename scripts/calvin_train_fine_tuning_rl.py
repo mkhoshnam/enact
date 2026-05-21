@@ -27,17 +27,39 @@ from omegaconf import OmegaConf
 from torchvision.models import ResNet18_Weights, resnet18
 
 
-CALVIN_ROOT = Path("/path/to/calvin")
-DATA_ROOT = CALVIN_ROOT / "dataset/task_D_D/training"
-OUT_BASE = Path("/path/to/enact_calvin_outputs")
-SEGMENTS_JSON = OUT_BASE / "calvin" / "segments_future_bc.json"
-BC_CKPT_PATH = OUT_BASE / "calvin_bc" / "bc_actor_best.pt"
-RESULTS_DIR = OUT_BASE / "calvin_fine_tuning_rl"
-FINAL_ACTOR_PATH = RESULTS_DIR / "fine_tuning_actor_final.pt"
-BEST_ACTOR_PATH = RESULTS_DIR / "fine_tuning_actor_best.pt"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def env_path(name, default=None):
+    value = os.environ.get(name)
+    if value:
+        return Path(value).expanduser()
+    if default is None:
+        return None
+    return Path(default).expanduser()
+
+
+SEED = int(os.environ.get("CALVIN_SEED", "42"))
+
+CALVIN_ROOT = env_path("CALVIN_ROOT")
+DATA_ROOT = env_path(
+    "CALVIN_DATA_ROOT",
+    CALVIN_ROOT / "dataset/task_D_D/training" if CALVIN_ROOT is not None else None,
+)
+OUT_BASE = env_path("ENACT_CALVIN_OUT_BASE", REPO_ROOT / "outputs")
+SEGMENTS_JSON = env_path("CALVIN_SEGMENTS_JSON", OUT_BASE / "calvin" / "segments_future_bc.json")
+BC_CKPT_PATH = env_path("CALVIN_BC_CKPT_PATH", OUT_BASE / "calvin_bc" / "bc_actor_best.pt")
+RESULTS_ROOT = env_path("CALVIN_RESULTS_ROOT", OUT_BASE)
+RUN_NAME = os.environ.get(
+    "CALVIN_RL_RUN_NAME",
+    "multitask_step6_rafc_td3bc_seed{}".format(SEED),
+)
+RESULTS_DIR = env_path("CALVIN_RL_RESULTS_DIR", RESULTS_ROOT / "rafc_rl_runs" / RUN_NAME)
+FINAL_ACTOR_PATH = env_path("CALVIN_RL_FINAL_ACTOR_PATH", RESULTS_DIR / "policy_final.pt")
+BEST_ACTOR_PATH = env_path("CALVIN_RL_BEST_ACTOR_PATH", RESULTS_DIR / "policy_best.pt")
 HISTORY_JSON = RESULTS_DIR / "history.json"
 
-GENERATED_FUTURE_ROOT = Path("/path/to/generated_inpainted_calvin_futures")
+GENERATED_FUTURE_ROOT = env_path("CALVIN_GENERATED_FUTURE_ROOT", OUT_BASE / "generated_inpainted_calvin_futures")
 USE_GENERATED_FUTURES_DURING_RL = os.environ.get("CALVIN_USE_GENERATED_FUTURES_DURING_RL", "0") == "1"
 USE_RAFC = os.environ.get("CALVIN_USE_RAFC", "1") != "0"
 FUTURE_SHIFTS = (-2, 0, 2)
@@ -48,7 +70,6 @@ RAFC_ENTROPY_REG = 0.0
 RAFC_ALPHA_TARGET = 0.70
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 42
 TRAIN_SPLIT = 0.90
 IMAGE_SIZE = None
 
@@ -119,6 +140,8 @@ def patch_yaml_tags_for_omegaconf():
 
 
 def compose_cfg():
+    if DATA_ROOT is None:
+        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before creating the CALVIN environment")
     conf_path = DATA_ROOT / ".hydra" / "merged_config.yaml"
     if not conf_path.exists():
         raise FileNotFoundError("Could not find merged_config at {}".format(conf_path))
@@ -199,12 +222,38 @@ class EpisodeCache(object):
         return self.cache[idx]
 
 
+def normalize_text(s):
+    s = str(s).lower().strip().replace("-", " ").replace("_", " ")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def load_segments(path):
     if not path.exists():
         raise FileNotFoundError("Missing segments json: {}".format(path))
     with open(path, "r", encoding="utf-8") as f:
         obj = json.load(f)
-    return obj["segments"], obj["tasks"], obj.get("task_to_id", {t: i for i, t in enumerate(obj["tasks"])})
+
+    if isinstance(obj, dict) and "segments" in obj:
+        segments = obj["segments"]
+        tasks = obj.get("tasks", None)
+        task_to_id = obj.get("task_to_id", None)
+    else:
+        segments = obj
+        tasks = None
+        task_to_id = None
+
+    if tasks is None:
+        tasks = sorted({
+            normalize_text(s["task"]).replace(" ", "_")
+            for s in segments
+            if "task" in s
+        })
+    if task_to_id is None:
+        task_to_id = {t: i for i, t in enumerate(tasks)}
+
+    return segments, tasks, task_to_id
 
 
 def split_segments(segments, train_split, seed):
@@ -1007,6 +1056,8 @@ def eval_agent(env, base_policy, agent, num_eps):
 def main():
     set_seed(SEED)
     ensure_dir(RESULTS_DIR)
+    if DATA_ROOT is None:
+        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before RL fine-tuning")
     if not DATA_ROOT.exists():
         raise FileNotFoundError("Missing DATA_ROOT: {}".format(DATA_ROOT))
     if not BC_CKPT_PATH.exists():

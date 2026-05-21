@@ -35,16 +35,41 @@ except Exception:
     openai = None
 
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "****")
-CALVIN_ROOT = Path("/path/to/calvin")
-DATA_ROOT = CALVIN_ROOT / "dataset/task_D_D/training"
-OUT_BASE = Path("/path/to/enact_calvin_outputs")
-SEGMENTS_JSON = OUT_BASE / "calvin" / "segments_future_bc.json"
-BC_CKPT_PATH = OUT_BASE / "calvin_bc" / "bc_actor_best.pt"
-FINE_TUNING_ACTOR_PATH = OUT_BASE / "calvin_fine_tuning_rl" / "fine_tuning_actor_best.pt"
-FUTURE_VIDEO_ROOT = Path("/path/to/generated_inpainted_calvin_futures")
-ONTOLOGY_PATH = OUT_BASE / "ontology" / "calvin_task_ontology.json"
-OUTPUT_DIR = OUT_BASE / "llm_future_policy_runs"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def env_path(name, default=None):
+    value = os.environ.get(name)
+    if value:
+        return Path(value).expanduser()
+    if default is None:
+        return None
+    return Path(default).expanduser()
+
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+SEED = int(os.environ.get("CALVIN_SEED", "42"))
+
+CALVIN_ROOT = env_path("CALVIN_ROOT")
+DATA_ROOT = env_path(
+    "CALVIN_DATA_ROOT",
+    CALVIN_ROOT / "dataset/task_D_D/training" if CALVIN_ROOT is not None else None,
+)
+OUT_BASE = env_path("ENACT_CALVIN_OUT_BASE", REPO_ROOT / "outputs")
+SEGMENTS_JSON = env_path("CALVIN_SEGMENTS_JSON", OUT_BASE / "calvin" / "segments_future_bc.json")
+BC_CKPT_PATH = env_path("CALVIN_BC_CKPT_PATH", OUT_BASE / "calvin_bc" / "bc_actor_best.pt")
+RESULTS_ROOT = env_path("CALVIN_RESULTS_ROOT", OUT_BASE)
+RUN_NAME = os.environ.get(
+    "CALVIN_RL_RUN_NAME",
+    "multitask_step6_rafc_td3bc_seed{}".format(SEED),
+)
+FINE_TUNING_ACTOR_PATH = env_path(
+    "CALVIN_FINE_TUNING_ACTOR_PATH",
+    RESULTS_ROOT / "rafc_rl_runs" / RUN_NAME / "policy_best.pt",
+)
+FUTURE_VIDEO_ROOT = env_path("CALVIN_GENERATED_FUTURE_ROOT", OUT_BASE / "generated_inpainted_calvin_futures")
+ONTOLOGY_PATH = env_path("CALVIN_ONTOLOGY_PATH", REPO_ROOT / "ontology" / "calvin_task_ontology.json")
+OUTPUT_DIR = env_path("CALVIN_INFERENCE_OUTPUT_DIR", OUT_BASE / "llm_future_policy_runs")
 FUTURE_SHIFTS = (-2, 0, 2)
 RAFC_INIT_ALPHA = 0.90
 RAFC_CENTER_LOGIT_BIAS = 3.0
@@ -53,7 +78,6 @@ FUTURE_EVAL_SHIFT = int(os.environ.get("CALVIN_FUTURE_SHIFT", "0"))
 WRONG_FUTURE_VIDEO_PATH = os.environ.get("CALVIN_WRONG_FUTURE_VIDEO_PATH", "")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 42
 SHOW_GUI = True
 SAVE_VIDEO = True
 VIDEO_FPS = 12
@@ -88,6 +112,8 @@ def patch_yaml_tags_for_omegaconf():
 
 
 def compose_cfg():
+    if DATA_ROOT is None:
+        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before creating the CALVIN environment")
     conf_path = DATA_ROOT / ".hydra" / "merged_config.yaml"
     if not conf_path.exists():
         raise FileNotFoundError("Could not find merged_config at {}".format(conf_path))
@@ -156,12 +182,38 @@ class EpisodeCache(object):
         return item
 
 
+def normalize_text(s):
+    s = str(s).lower().strip().replace("-", " ").replace("_", " ")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def load_segments(path):
     if not path.exists():
         raise FileNotFoundError("Missing segments json: {}".format(path))
     with open(path, "r", encoding="utf-8") as f:
         obj = json.load(f)
-    return obj["segments"], obj["tasks"], obj.get("task_to_id", {t: i for i, t in enumerate(obj["tasks"])})
+
+    if isinstance(obj, dict) and "segments" in obj:
+        segments = obj["segments"]
+        tasks = obj.get("tasks", None)
+        task_to_id = obj.get("task_to_id", None)
+    else:
+        segments = obj
+        tasks = None
+        task_to_id = None
+
+    if tasks is None:
+        tasks = sorted({
+            normalize_text(s["task"]).replace(" ", "_")
+            for s in segments
+            if "task" in s
+        })
+    if task_to_id is None:
+        task_to_id = {t: i for i, t in enumerate(tasks)}
+
+    return segments, tasks, task_to_id
 
 
 def split_segments(segments, train_split, seed):
@@ -185,6 +237,34 @@ def resize_if_needed(img, image_size=None):
     if image_size is None:
         return img
     return cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_AREA)
+
+
+def sample_future_indices(cur_idx, goal_idx, num_future_frames):
+    if goal_idx <= cur_idx:
+        return np.full((num_future_frames,), cur_idx, dtype=np.int32)
+    start = cur_idx + 1
+    stop = goal_idx
+    if start >= stop:
+        return np.full((num_future_frames,), stop, dtype=np.int32)
+    vals = np.linspace(start, stop, num=num_future_frames)
+    vals = np.rint(vals).astype(np.int32)
+    return np.clip(vals, start, stop)
+
+
+def default_future_video_path(task):
+    return FUTURE_VIDEO_ROOT / task / "inpainted_robot_future.mp4"
+
+
+def resolve_future_video_path(task, path_value):
+    raw = str(path_value or "").strip()
+    if not raw:
+        return default_future_video_path(task)
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+    if len(path.parts) > 0 and path.parts[0] == task:
+        return FUTURE_VIDEO_ROOT / path
+    return OUT_BASE / path
 
 
 def read_future_video(path, count, image_size=None):
@@ -222,9 +302,9 @@ def shift_future(future_static, shift):
     return future_static[idx].astype(np.uint8)
 
 
-def make_rafc_future_batch(future_static):
+def make_rafc_future_batch(future_static, future_shifts=FUTURE_SHIFTS):
     futures = [make_null_future(future_static)]
-    futures.extend(shift_future(future_static, shift) for shift in FUTURE_SHIFTS)
+    futures.extend(shift_future(future_static, shift) for shift in future_shifts)
     return np.stack(futures, axis=0).astype(np.uint8)
 
 
@@ -329,13 +409,17 @@ def pick_task_from_ontology(command, tasks, ontology):
 def fallback_plan(command, tasks, ontology):
     task = pick_task_from_ontology(command, tasks, ontology)
     meta = ontology_tasks(ontology).get(task, {})
+    future_video_path = resolve_future_video_path(
+        task,
+        meta.get("future_video_path", meta.get("generated_video_path", "")),
+    )
     return {
         "task_key": task,
         "selected_object": meta.get("object", meta.get("target_object", "")),
         "interaction_part": meta.get("interaction_part", meta.get("part", "")),
         "motion_type": meta.get("motion_type", meta.get("motion", "")),
         "future_caption": meta.get("future_caption", "a robot arm completing the task: {}".format(command)),
-        "generated_video_path": meta.get("future_video_path", meta.get("generated_video_path", str(FUTURE_VIDEO_ROOT / task / "inpainted_robot_future.mp4"))),
+        "generated_video_path": str(future_video_path),
         "success_criteria": meta.get("success_criteria", "CALVIN oracle reports task success"),
         "reasoning": "matched the command to the ontology entry",
     }
@@ -345,7 +429,7 @@ def query_llm_for_task(command, tasks, obs_state, ontology):
     fallback = fallback_plan(command, tasks, ontology)
     task_meta = ontology_tasks(ontology)
 
-    if OPENAI_API_KEY == "****" or openai is None:
+    if not OPENAI_API_KEY or openai is None:
         return fallback
 
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -404,7 +488,10 @@ Return valid JSON only.
         plan.setdefault("motion_type", meta.get("motion_type", meta.get("motion", "")))
         plan.setdefault("future_caption", meta.get("future_caption", fallback["future_caption"]))
         plan.setdefault("success_criteria", meta.get("success_criteria", fallback["success_criteria"]))
-        plan.setdefault("generated_video_path", meta.get("future_video_path", fallback["generated_video_path"]))
+        plan["generated_video_path"] = str(resolve_future_video_path(
+            plan["task_key"],
+            plan.get("generated_video_path", meta.get("future_video_path", fallback["generated_video_path"])),
+        ))
         return plan
     except Exception as exc:
         fallback["reasoning"] = "matched the command to the ontology entry"
@@ -671,8 +758,11 @@ class LLMFuturePolicyRunner(object):
         self.obs_gripper_hist = deque(maxlen=base_policy.obs_horizon)
         self.last_obs = None
         future_path = WRONG_FUTURE_VIDEO_PATH if FUTURE_EVAL_MODE == "wrong" and WRONG_FUTURE_VIDEO_PATH else plan["generated_video_path"]
-        self.future_static = apply_future_eval_mode(read_future_video(future_path, base_policy.future_horizon, IMAGE_SIZE))
-        self.future_path = future_path
+        self.future_path = resolve_future_video_path(self.task, future_path)
+        self.generated_future_static = None
+        if self.future_path.exists():
+            self.generated_future_static = apply_future_eval_mode(read_future_video(self.future_path, base_policy.future_horizon, IMAGE_SIZE))
+        self.future_static = None
 
     def _ensure_env(self):
         if self.env is None:
@@ -684,10 +774,25 @@ class LLMFuturePolicyRunner(object):
             raise RuntimeError("No eval segments found for task {}".format(self.task))
         return candidates[episode_id % len(candidates)]
 
+    def _demo_future(self, aligned_idx):
+        seg_end = int(self.current_segment["global_end_idx"])
+        fut_idx = sample_future_indices(aligned_idx, seg_end, self.base_policy.future_horizon)
+        return np.stack(
+            [
+                resize_if_needed(np.asarray(self.cache.get(int(j))["rgb_static"], dtype=np.uint8), IMAGE_SIZE)
+                for j in fut_idx
+            ],
+            axis=0,
+        )
+
     def reset(self, episode_id):
         self._ensure_env()
         self.current_segment = self._segment_for_task(episode_id)
         start_idx = int(self.current_segment["global_start_idx"])
+        if self.generated_future_static is None:
+            self.future_static = apply_future_eval_mode(self._demo_future(start_idx))
+        else:
+            self.future_static = self.generated_future_static
         item = self.cache.get(start_idx)
         obs = self.env.reset(robot_obs=np.asarray(item["robot_obs"], dtype=np.float32), scene_obs=np.asarray(item["scene_obs"], dtype=np.float32))
         self.start_info = self.env.get_info()
@@ -748,8 +853,8 @@ def to_base_action(base):
     return np.concatenate([base["base_arm"][:ARM_ACTION_DIM], np.asarray([base["base_grip"]], dtype=np.float32)], axis=0).astype(np.float32)
 
 
-def extract_rafc_inputs(base_policy, pi):
-    future_batch = make_rafc_future_batch(pi["future_static"])
+def extract_rafc_inputs(base_policy, pi, future_shifts=FUTURE_SHIFTS):
+    future_batch = make_rafc_future_batch(pi["future_static"], future_shifts=future_shifts)
     batch = base_policy.extract_many(
         pi["obs_static"],
         pi["obs_gripper"],
@@ -770,6 +875,10 @@ def extract_rafc_inputs(base_policy, pi):
 def main():
     set_seed(SEED)
     ensure_dir(OUTPUT_DIR)
+    if CALVIN_ROOT is None:
+        raise RuntimeError("Set CALVIN_ROOT before running CALVIN inference")
+    if DATA_ROOT is None:
+        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before running CALVIN inference")
     os.chdir(CALVIN_ROOT)
     os.environ["CALVIN_ROOT"] = str(CALVIN_ROOT)
 
@@ -819,7 +928,7 @@ def main():
             gate_weights = []
             while not success and not env_done and steps < MAX_EPISODE_STEPS:
                 if fine_tuning_actor.uses_rafc:
-                    rafc = extract_rafc_inputs(base_policy, pi)
+                    rafc = extract_rafc_inputs(base_policy, pi, fine_tuning_actor.future_shifts)
                     delta, gate_info = fine_tuning_actor.act_rafc(rafc)
                     base_action = gate_info["base_action"]
                     gate_alphas.append(float(gate_info["alpha"].mean()))

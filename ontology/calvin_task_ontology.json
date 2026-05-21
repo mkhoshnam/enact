@@ -257,7 +257,7 @@
       "motion_type": "pull outward until the drawer is open",
       "success_criteria": "drawer reaches the open state according to the CALVIN task oracle",
       "future_caption": "a robot arm opens the drawer in the CALVIN scene",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/open_drawer/inpainted_robot_future.mp4"
+      "future_video_path": "open_drawer/inpainted_robot_future.mp4"
     },
     "close_drawer": {
       "task_key": "close_drawer",
@@ -276,7 +276,7 @@
       "motion_type": "push inward until the drawer is closed",
       "success_criteria": "drawer reaches the closed state according to the CALVIN task oracle",
       "future_caption": "a robot arm closes the drawer in the CALVIN scene",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/close_drawer/inpainted_robot_future.mp4"
+      "future_video_path": "close_drawer/inpainted_robot_future.mp4"
     },
     "push_into_drawer": {
       "task_key": "push_into_drawer",
@@ -297,7 +297,7 @@
       "motion_type": "push the object into the open drawer",
       "success_criteria": "the object is inside the drawer according to the CALVIN task oracle",
       "future_caption": "a robot arm pushes the block into the drawer",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/push_into_drawer/inpainted_robot_future.mp4"
+      "future_video_path": "push_into_drawer/inpainted_robot_future.mp4"
     },
     "turn_on_led": {
       "task_key": "turn_on_led",
@@ -317,7 +317,7 @@
       "motion_type": "press the LED button",
       "success_criteria": "green LED is on according to the CALVIN task oracle",
       "future_caption": "a robot arm presses the green LED button to turn it on",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_on_led/inpainted_robot_future.mp4"
+      "future_video_path": "turn_on_led/inpainted_robot_future.mp4"
     },
     "turn_off_led": {
       "task_key": "turn_off_led",
@@ -337,7 +337,7 @@
       "motion_type": "press the LED button",
       "success_criteria": "green LED is off according to the CALVIN task oracle",
       "future_caption": "a robot arm presses the green LED button to turn it off",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_off_led/inpainted_robot_future.mp4"
+      "future_video_path": "turn_off_led/inpainted_robot_future.mp4"
     },
     "turn_on_lightbulb": {
       "task_key": "turn_on_lightbulb",
@@ -357,7 +357,7 @@
       "motion_type": "move the switch toward the on state",
       "success_criteria": "lightbulb is on according to the CALVIN task oracle",
       "future_caption": "a robot arm moves the lightbulb switch to turn it on",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_on_lightbulb/inpainted_robot_future.mp4"
+      "future_video_path": "turn_on_lightbulb/inpainted_robot_future.mp4"
     },
     "turn_off_lightbulb": {
       "task_key": "turn_off_lightbulb",
@@ -377,7 +377,7 @@
       "motion_type": "move the switch toward the off state",
       "success_criteria": "lightbulb is off according to the CALVIN task oracle",
       "future_caption": "a robot arm moves the lightbulb switch to turn it off",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/turn_off_lightbulb/inpainted_robot_future.mp4"
+      "future_video_path": "turn_off_lightbulb/inpainted_robot_future.mp4"
     },
     "move_slider_left": {
       "task_key": "move_slider_left",
@@ -396,7 +396,7 @@
       "motion_type": "push the slider left",
       "success_criteria": "slider reaches the left target state according to the CALVIN task oracle",
       "future_caption": "a robot arm pushes the slider to the left",
-      "future_video_path": "/path/to/generated_inpainted_calvin_futures/move_slider_left/inpainted_robot_future.mp4"
+      "future_video_path": "move_slider_left/inpainted_robot_future.mp4"
     }
   }
 }
