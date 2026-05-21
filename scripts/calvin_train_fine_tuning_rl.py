@@ -10,6 +10,14 @@ if not hasattr(np, "object"):
 
 import json
 import os
+
+USE_EGL = os.environ.get("CALVIN_USE_EGL", "1") == "1"
+
+if USE_EGL:
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYGLET_HEADLESS", "true")
+
 import random
 import re
 import yaml
@@ -154,7 +162,7 @@ def make_env(show_gui):
     try:
         OmegaConf.set_struct(cfg, False)
         cfg.env.show_gui = bool(show_gui)
-        cfg.env.use_egl = False
+        cfg.env.use_egl = bool(USE_EGL) and not bool(show_gui)
         cfg.env.use_scene_info = True
     except Exception:
         pass

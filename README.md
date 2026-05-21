@@ -101,6 +101,9 @@ Use generated futures and/or disable RAFC for baseline checkpoints:
     CALVIN_USE_GENERATED_FUTURES_DURING_RL=1 python scripts/calvin_train_fine_tuning_rl.py
     CALVIN_USE_RAFC=0 python scripts/calvin_train_fine_tuning_rl.py
 
+Headless CALVIN runs use EGL by default. Set `CALVIN_USE_EGL=0` when you need
+non-EGL rendering or GUI debugging.
+
 Run inference:
 
     python scripts/calvin_infer_llm_future_bc_rl.py
