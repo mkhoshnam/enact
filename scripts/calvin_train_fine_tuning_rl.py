@@ -318,12 +318,15 @@ class FutureBC(nn.Module):
         token_types = ([0] * self.chunk_horizon + [1] + [2] + [3] * self.obs_horizon + [4] * self.obs_horizon + [5] * self.future_horizon)
         token_types = torch.tensor(token_types, dtype=torch.long, device=x.device).unsqueeze(0).expand(bsz, -1)
         x = x + self.modality_emb(token_types) + self.pos_emb[:, :x.shape[1], :]
-        x = self.transformer(self.input_norm(x))
-        return self.output_norm(x[:, :self.chunk_horizon])
+        x = self.output_norm(self.transformer(self.input_norm(x)))
+        future_start = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon
+        action_latent = x[:, :self.chunk_horizon]
+        future_latent = x[:, future_start:future_start + self.future_horizon].mean(dim=1)
+        return action_latent, future_latent
 
     def forward_with_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
-        z = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
-        return z, self.arm_head(z), self.gripper_head(z).squeeze(-1)
+        z, g_t = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
+        return z, g_t, self.arm_head(z), self.gripper_head(z).squeeze(-1)
 
 
 class FrozenBCPolicy(object):
@@ -367,23 +370,30 @@ class FrozenBCPolicy(object):
         task_t = torch.tensor([self.task_id(task_name)], dtype=torch.long, device=self.device)
         goal_t = torch.tensor([int(goal_type)], dtype=torch.long, device=self.device)
         with torch.no_grad():
-            z, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
+            z, g_t, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
         z = z[0]
         feat = torch.cat([z[0], z.mean(dim=0)], dim=-1).cpu().numpy().astype(np.float32)
+        g_t = g_t[0].cpu().numpy().astype(np.float32)
         arm_chunk_n = arm_chunk_n[0].cpu().numpy().astype(np.float32)
         arm_chunk = arm_chunk_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
         base_grip = 1.0 if float(torch.sigmoid(grip_logits[0, 0]).item()) > 0.5 else -1.0
-        return {"feature": feat, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+        return {"feature": feat, "g_t": g_t, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+
+    def extract_with_future_latent(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
+        base = self.extract(obs_static, obs_gripper, future_static, task_name, goal_type)
+        base_action = np.concatenate([base["base_arm"][:self.arm_dim], np.asarray([base["base_grip"]], dtype=np.float32)], axis=0).astype(np.float32)
+        return base["feature"], base["g_t"], base_action
 
 
 class FineTuningActor(nn.Module):
-    def __init__(self, feature_dim, action_dim, arm_dim, arm_limit, grip_limit):
+    def __init__(self, feature_dim, g_dim, action_dim, arm_dim, arm_limit, grip_limit):
         super().__init__()
         self.arm_dim = int(arm_dim)
         self.action_dim = int(action_dim)
+        self.g_dim = int(g_dim)
         self.register_buffer("limit_vec", torch.tensor([arm_limit] * arm_dim + [grip_limit], dtype=torch.float32).view(1, -1))
         self.net = nn.Sequential(
-            nn.Linear(int(feature_dim) + int(action_dim), 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
+            nn.Linear(int(feature_dim) + self.g_dim + int(action_dim), 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
             nn.Linear(512, 512), nn.ReLU(inplace=True),
             nn.Linear(512, 256), nn.ReLU(inplace=True),
             nn.Linear(256, action_dim),
@@ -391,36 +401,37 @@ class FineTuningActor(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, feature, base_action):
-        x = torch.cat([feature, base_action], dim=-1)
+    def forward(self, feature, g_t, base_action):
+        x = torch.cat([feature, g_t, base_action], dim=-1)
         return torch.tanh(self.net(x)) * self.limit_vec.to(x.device)
 
 
 class CriticQ(nn.Module):
-    def __init__(self, feature_dim, priv_dim, action_dim):
+    def __init__(self, feature_dim, g_dim, priv_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(int(feature_dim) + int(priv_dim) + int(action_dim) * 2, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
+            nn.Linear(int(feature_dim) + int(g_dim) + int(priv_dim) + int(action_dim) * 2, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
             nn.Linear(512, 512), nn.ReLU(inplace=True),
             nn.Linear(512, 256), nn.ReLU(inplace=True),
             nn.Linear(256, 1),
         )
 
-    def forward(self, feature, priv_state, base_action, delta_action):
-        return self.net(torch.cat([feature, priv_state, base_action, delta_action], dim=-1))
+    def forward(self, feature, g_t, priv_state, base_action, delta_action):
+        return self.net(torch.cat([feature, g_t, priv_state, base_action, delta_action], dim=-1))
 
 
 class TD3FineTuningAgent(object):
-    def __init__(self, feature_dim, priv_dim, action_dim, arm_dim, device):
+    def __init__(self, feature_dim, g_dim, priv_dim, action_dim, arm_dim, device):
         self.device = device
         self.feature_dim = int(feature_dim)
+        self.g_dim = int(g_dim)
         self.priv_dim = int(priv_dim)
         self.action_dim = int(action_dim)
         self.arm_dim = int(arm_dim)
-        self.actor = FineTuningActor(feature_dim, action_dim, arm_dim, DELTA_ARM_LIMIT, GRIP_DELTA_LIMIT).to(device)
+        self.actor = FineTuningActor(feature_dim, g_dim, action_dim, arm_dim, DELTA_ARM_LIMIT, GRIP_DELTA_LIMIT).to(device)
         self.actor_target = deepcopy(self.actor).to(device)
-        self.critic1 = CriticQ(feature_dim, priv_dim, action_dim).to(device)
-        self.critic2 = CriticQ(feature_dim, priv_dim, action_dim).to(device)
+        self.critic1 = CriticQ(feature_dim, g_dim, priv_dim, action_dim).to(device)
+        self.critic2 = CriticQ(feature_dim, g_dim, priv_dim, action_dim).to(device)
         self.critic1_target = deepcopy(self.critic1).to(device)
         self.critic2_target = deepcopy(self.critic2).to(device)
         self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=ACTOR_LR, weight_decay=WEIGHT_DECAY)
@@ -428,11 +439,12 @@ class TD3FineTuningAgent(object):
         self.total_updates = 0
         self.limit_vec_np = np.asarray([DELTA_ARM_LIMIT] * arm_dim + [GRIP_DELTA_LIMIT], dtype=np.float32)
 
-    def act(self, feature_np, base_action_np, add_noise=True):
+    def act(self, feature_np, g_np, base_action_np, add_noise=True):
         feature = torch.from_numpy(feature_np).unsqueeze(0).to(self.device)
+        g_t = torch.from_numpy(g_np).unsqueeze(0).to(self.device)
         base_action = torch.from_numpy(base_action_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            delta = self.actor(feature, base_action)[0].cpu().numpy()
+            delta = self.actor(feature, g_t, base_action)[0].cpu().numpy()
         if add_noise:
             noise = np.random.normal(0.0, EXPL_NOISE_STD, size=delta.shape).astype(np.float32)
             delta = delta + np.clip(noise, -EXPL_NOISE_CLIP, EXPL_NOISE_CLIP)
@@ -441,11 +453,13 @@ class TD3FineTuningAgent(object):
     def train_step(self, replay, batch_size):
         batch = replay.sample(batch_size)
         feature = torch.from_numpy(batch["feature"]).to(self.device)
+        g_t = torch.from_numpy(batch["g"]).to(self.device)
         priv_state = torch.from_numpy(batch["priv_state"]).to(self.device)
         base_action = torch.from_numpy(batch["base_action"]).to(self.device)
         delta_action = torch.from_numpy(batch["delta_action"]).to(self.device)
         reward = torch.from_numpy(batch["reward"]).to(self.device)
         next_feature = torch.from_numpy(batch["next_feature"]).to(self.device)
+        next_g = torch.from_numpy(batch["next_g"]).to(self.device)
         next_priv_state = torch.from_numpy(batch["next_priv_state"]).to(self.device)
         next_base_action = torch.from_numpy(batch["next_base_action"]).to(self.device)
         done = torch.from_numpy(batch["done"]).to(self.device)
@@ -453,12 +467,12 @@ class TD3FineTuningAgent(object):
             noise = torch.randn_like(delta_action) * POLICY_NOISE
             noise = torch.clamp(noise, -NOISE_CLIP, NOISE_CLIP)
             limit_vec = self.actor.limit_vec.to(self.device)
-            next_delta = torch.clamp(self.actor_target(next_feature, next_base_action) + noise, -limit_vec, limit_vec)
-            q1_t = self.critic1_target(next_feature, next_priv_state, next_base_action, next_delta)
-            q2_t = self.critic2_target(next_feature, next_priv_state, next_base_action, next_delta)
+            next_delta = torch.clamp(self.actor_target(next_feature, next_g, next_base_action) + noise, -limit_vec, limit_vec)
+            q1_t = self.critic1_target(next_feature, next_g, next_priv_state, next_base_action, next_delta)
+            q2_t = self.critic2_target(next_feature, next_g, next_priv_state, next_base_action, next_delta)
             target = reward + (1.0 - done) * DISCOUNT * torch.min(q1_t, q2_t)
-        q1 = self.critic1(feature, priv_state, base_action, delta_action)
-        q2 = self.critic2(feature, priv_state, base_action, delta_action)
+        q1 = self.critic1(feature, g_t, priv_state, base_action, delta_action)
+        q2 = self.critic2(feature, g_t, priv_state, base_action, delta_action)
         critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
@@ -467,8 +481,8 @@ class TD3FineTuningAgent(object):
         logs = {"critic_loss": float(critic_loss.item()), "q1": float(q1.mean().item())}
         self.total_updates += 1
         if self.total_updates % POLICY_DELAY == 0:
-            delta = self.actor(feature, base_action)
-            actor_loss = -self.critic1(feature, priv_state, base_action, delta).mean()
+            delta = self.actor(feature, g_t, base_action)
+            actor_loss = -self.critic1(feature, g_t, priv_state, base_action, delta).mean()
             self.actor_opt.zero_grad(set_to_none=True)
             actor_loss.backward()
             nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
@@ -488,6 +502,7 @@ class TD3FineTuningAgent(object):
         torch.save({
             "actor_state_dict": self.actor.state_dict(),
             "feature_dim": self.feature_dim,
+            "g_dim": self.g_dim,
             "priv_dim": self.priv_dim,
             "action_dim": self.action_dim,
             "arm_dim": self.arm_dim,
@@ -497,28 +512,32 @@ class TD3FineTuningAgent(object):
 
 
 class ReplayBuffer(object):
-    def __init__(self, capacity, feature_dim, priv_dim, action_dim):
+    def __init__(self, capacity, feature_dim, g_dim, priv_dim, action_dim):
         self.capacity = int(capacity)
         self.feature = np.zeros((capacity, feature_dim), dtype=np.float32)
+        self.g = np.zeros((capacity, g_dim), dtype=np.float32)
         self.priv_state = np.zeros((capacity, priv_dim), dtype=np.float32)
         self.base_action = np.zeros((capacity, action_dim), dtype=np.float32)
         self.delta_action = np.zeros((capacity, action_dim), dtype=np.float32)
         self.reward = np.zeros((capacity, 1), dtype=np.float32)
         self.next_feature = np.zeros((capacity, feature_dim), dtype=np.float32)
+        self.next_g = np.zeros((capacity, g_dim), dtype=np.float32)
         self.next_priv_state = np.zeros((capacity, priv_dim), dtype=np.float32)
         self.next_base_action = np.zeros((capacity, action_dim), dtype=np.float32)
         self.done = np.zeros((capacity, 1), dtype=np.float32)
         self.ptr = 0
         self.size = 0
 
-    def add(self, feature, priv_state, base_action, delta_action, reward, next_feature, next_priv_state, next_base_action, done):
+    def add(self, feature, g_t, priv_state, base_action, delta_action, reward, next_feature, next_g, next_priv_state, next_base_action, done):
         i = self.ptr
         self.feature[i] = feature
+        self.g[i] = g_t
         self.priv_state[i] = priv_state
         self.base_action[i] = base_action
         self.delta_action[i] = delta_action
         self.reward[i, 0] = float(reward)
         self.next_feature[i] = next_feature
+        self.next_g[i] = next_g
         self.next_priv_state[i] = next_priv_state
         self.next_base_action[i] = next_base_action
         self.done[i, 0] = float(done)
@@ -529,11 +548,13 @@ class ReplayBuffer(object):
         idx = np.random.randint(0, self.size, size=int(batch_size))
         return {
             "feature": self.feature[idx],
+            "g": self.g[idx],
             "priv_state": self.priv_state[idx],
             "base_action": self.base_action[idx],
             "delta_action": self.delta_action[idx],
             "reward": self.reward[idx],
             "next_feature": self.next_feature[idx],
+            "next_g": self.next_g[idx],
             "next_priv_state": self.next_priv_state[idx],
             "next_base_action": self.next_base_action[idx],
             "done": self.done[idx],
@@ -740,7 +761,7 @@ def eval_agent(env, base_policy, agent, num_eps):
         while not done and not trunc:
             base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
             base_action = to_base_action(base)
-            delta = agent.act(base["feature"], base_action, add_noise=False)
+            delta = agent.act(base["feature"], base["g_t"], base_action, add_noise=False)
             full_action = env._compose_full_action(base_action, delta)
             pi, _, done, trunc, last = env.step(full_action, delta)
             step += 1
@@ -769,9 +790,10 @@ def main():
     pi, info = train_env.reset(seed=SEED)
     base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
     feature_dim = int(base["feature"].shape[0])
+    g_dim = int(base["g_t"].shape[0])
     priv_dim = int(pi["priv_state"].shape[0])
-    replay = ReplayBuffer(BUFFER_SIZE, feature_dim, priv_dim, ACTION_DIM)
-    agent = TD3FineTuningAgent(feature_dim, priv_dim, ACTION_DIM, ARM_ACTION_DIM, DEVICE)
+    replay = ReplayBuffer(BUFFER_SIZE, feature_dim, g_dim, priv_dim, ACTION_DIM)
+    agent = TD3FineTuningAgent(feature_dim, g_dim, priv_dim, ACTION_DIM, ARM_ACTION_DIM, DEVICE)
 
     history = []
     best_success = -1.0
@@ -787,22 +809,24 @@ def main():
             limit_vec = np.asarray([DELTA_ARM_LIMIT] * ARM_ACTION_DIM + [GRIP_DELTA_LIMIT], dtype=np.float32)
             delta = np.random.uniform(low=-limit_vec, high=limit_vec).astype(np.float32)
         else:
-            delta = agent.act(base["feature"], base_action, add_noise=True)
+            delta = agent.act(base["feature"], base["g_t"], base_action, add_noise=True)
         full_action = train_env._compose_full_action(base_action, delta)
         next_pi, reward, done, truncated, step_info = train_env.step(full_action, delta)
         terminal = bool(done or truncated)
 
         if next_pi is None:
             next_feature = base["feature"].copy()
+            next_g = base["g_t"].copy()
             next_base_action = base_action.copy()
             next_priv = pi["priv_state"].copy()
         else:
             next_base = base_policy.extract(next_pi["obs_static"], next_pi["obs_gripper"], next_pi["future_static"], next_pi["task"], next_pi["goal_type"])
             next_feature = next_base["feature"].copy()
+            next_g = next_base["g_t"].copy()
             next_base_action = to_base_action(next_base)
             next_priv = next_pi["priv_state"].copy()
 
-        replay.add(base["feature"], pi["priv_state"], base_action, delta, reward, next_feature, next_priv, next_base_action, float(terminal))
+        replay.add(base["feature"], base["g_t"], pi["priv_state"], base_action, delta, reward, next_feature, next_g, next_priv, next_base_action, float(terminal))
         episode_reward += float(reward)
         episode_steps += 1
 

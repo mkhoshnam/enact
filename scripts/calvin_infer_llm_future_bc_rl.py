@@ -435,12 +435,15 @@ class FutureBC(nn.Module):
         token_types = ([0] * self.chunk_horizon + [1] + [2] + [3] * self.obs_horizon + [4] * self.obs_horizon + [5] * self.future_horizon)
         token_types = torch.tensor(token_types, dtype=torch.long, device=x.device).unsqueeze(0).expand(bsz, -1)
         x = x + self.modality_emb(token_types) + self.pos_emb[:, :x.shape[1], :]
-        x = self.transformer(self.input_norm(x))
-        return self.output_norm(x[:, :self.chunk_horizon])
+        x = self.output_norm(self.transformer(self.input_norm(x)))
+        future_start = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon
+        action_latent = x[:, :self.chunk_horizon]
+        future_latent = x[:, future_start:future_start + self.future_horizon].mean(dim=1)
+        return action_latent, future_latent
 
     def forward_with_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
-        z = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
-        return z, self.arm_head(z), self.gripper_head(z).squeeze(-1)
+        z, g_t = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
+        return z, g_t, self.arm_head(z), self.gripper_head(z).squeeze(-1)
 
 
 class FrozenBCPolicy(object):
@@ -482,28 +485,35 @@ class FrozenBCPolicy(object):
         task_t = torch.tensor([task_id], dtype=torch.long, device=self.device)
         goal_t = torch.tensor([int(goal_type)], dtype=torch.long, device=self.device)
         with torch.no_grad():
-            z, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
+            z, g_t, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
         z = z[0]
         feat = torch.cat([z[0], z.mean(dim=0)], dim=-1).cpu().numpy().astype(np.float32)
+        g_t = g_t[0].cpu().numpy().astype(np.float32)
         arm_chunk_n = arm_chunk_n[0].cpu().numpy().astype(np.float32)
         arm_chunk = arm_chunk_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
         base_grip = 1.0 if float(torch.sigmoid(grip_logits[0, 0]).item()) > 0.5 else -1.0
-        return {"feature": feat, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+        return {"feature": feat, "g_t": g_t, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+
+    def extract_with_future_latent(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
+        base = self.extract(obs_static, obs_gripper, future_static, task_name, goal_type)
+        base_action = np.concatenate([base["base_arm"][:self.arm_dim], np.asarray([base["base_grip"]], dtype=np.float32)], axis=0).astype(np.float32)
+        return base["feature"], base["g_t"], base_action
 
 
 class FineTuningActor(nn.Module):
-    def __init__(self, feature_dim, action_dim, arm_dim, arm_limit, grip_limit):
+    def __init__(self, feature_dim, g_dim, action_dim, arm_dim, arm_limit, grip_limit):
         super().__init__()
+        self.g_dim = int(g_dim)
         self.register_buffer("limit_vec", torch.tensor([arm_limit] * arm_dim + [grip_limit], dtype=torch.float32).view(1, -1))
         self.net = nn.Sequential(
-            nn.Linear(int(feature_dim) + int(action_dim), 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
+            nn.Linear(int(feature_dim) + self.g_dim + int(action_dim), 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
             nn.Linear(512, 512), nn.ReLU(inplace=True),
             nn.Linear(512, 256), nn.ReLU(inplace=True),
             nn.Linear(256, action_dim),
         )
 
-    def forward(self, feature, base_action):
-        x = torch.cat([feature, base_action], dim=-1)
+    def forward(self, feature, g_t, base_action):
+        x = torch.cat([feature, g_t, base_action], dim=-1)
         return torch.tanh(self.net(x)) * self.limit_vec.to(x.device)
 
 
@@ -512,20 +522,25 @@ class FineTuningActorWrapper(object):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         self.device = device
         self.feature_dim = int(ckpt["feature_dim"])
+        self.g_dim = int(ckpt.get("g_dim", 0))
         self.action_dim = int(ckpt.get("action_dim", ACTION_DIM))
         self.arm_dim = int(ckpt.get("arm_dim", ARM_ACTION_DIM))
         self.arm_limit = float(ckpt.get("delta_arm_limit", 0.10))
         self.grip_limit = float(ckpt.get("grip_delta_limit", 2.0))
-        self.actor = FineTuningActor(self.feature_dim, self.action_dim, self.arm_dim, self.arm_limit, self.grip_limit).to(device)
+        self.actor = FineTuningActor(self.feature_dim, self.g_dim, self.action_dim, self.arm_dim, self.arm_limit, self.grip_limit).to(device)
         self.actor.load_state_dict(ckpt["actor_state_dict"])
         self.actor.eval()
         self.limit_vec_np = np.asarray([self.arm_limit] * self.arm_dim + [self.grip_limit], dtype=np.float32)
 
-    def act(self, feature_np, base_action_np):
+    def act(self, feature_np, g_np, base_action_np):
         feature = torch.from_numpy(feature_np).unsqueeze(0).to(self.device)
+        if self.g_dim > 0:
+            g_t = torch.from_numpy(g_np).unsqueeze(0).to(self.device)
+        else:
+            g_t = torch.zeros((1, 0), dtype=feature.dtype, device=self.device)
         base_action = torch.from_numpy(base_action_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            delta = self.actor(feature, base_action)[0].cpu().numpy()
+            delta = self.actor(feature, g_t, base_action)[0].cpu().numpy()
         return np.clip(delta, -self.limit_vec_np, self.limit_vec_np).astype(np.float32)
 
 
@@ -669,7 +684,7 @@ def main():
             while not success and not env_done and steps < MAX_EPISODE_STEPS:
                 base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
                 base_action = to_base_action(base)
-                delta = fine_tuning_actor.act(base["feature"], base_action)
+                delta = fine_tuning_actor.act(base["feature"], base["g_t"], base_action)
                 action = runner.compose_action(base_action, delta)
                 pi, success, env_done, last_info = runner.step(action)
                 steps += 1
