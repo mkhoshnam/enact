@@ -28,6 +28,7 @@ This repository currently releases the CALVIN part of ENACT:
 - BC-initialized RL fine-tuning
 - ontology/LLM-guided inference
 - generated future video conditioning
+- reliability-aware future conditioning for generated, wrong, and shifted futures
 
 The RoboCasa scripts, generated futures, and trained models are part of the same ENACT project and will be released soon.
 
@@ -85,6 +86,11 @@ Fine-tune with RL:
 
     python scripts/calvin_train_fine_tuning_rl.py
 
+Use generated futures and/or disable RAFC for baseline checkpoints:
+
+    CALVIN_USE_GENERATED_FUTURES_DURING_RL=1 python scripts/calvin_train_fine_tuning_rl.py
+    CALVIN_USE_RAFC=0 python scripts/calvin_train_fine_tuning_rl.py
+
 Run inference:
 
     python scripts/calvin_infer_llm_future_bc_rl.py
@@ -92,6 +98,12 @@ Run inference:
 Example command:
 
     turn on the green led
+
+For RAFC ablations, inference accepts simple environment switches:
+
+    CALVIN_FUTURE_MODE=null python scripts/calvin_infer_llm_future_bc_rl.py
+    CALVIN_FUTURE_MODE=shift CALVIN_FUTURE_SHIFT=4 python scripts/calvin_infer_llm_future_bc_rl.py
+    CALVIN_FUTURE_MODE=wrong CALVIN_WRONG_FUTURE_VIDEO_PATH=/path/to/wrong_future.mp4 python scripts/calvin_infer_llm_future_bc_rl.py
 
 ## Notes
 

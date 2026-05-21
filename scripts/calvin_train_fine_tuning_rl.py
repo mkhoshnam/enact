@@ -9,6 +9,7 @@ if not hasattr(np, "object"):
     np.object = object
 
 import json
+import os
 import random
 import re
 import yaml
@@ -37,7 +38,14 @@ BEST_ACTOR_PATH = RESULTS_DIR / "fine_tuning_actor_best.pt"
 HISTORY_JSON = RESULTS_DIR / "history.json"
 
 GENERATED_FUTURE_ROOT = Path("/path/to/generated_inpainted_calvin_futures")
-USE_GENERATED_FUTURES_DURING_RL = False
+USE_GENERATED_FUTURES_DURING_RL = os.environ.get("CALVIN_USE_GENERATED_FUTURES_DURING_RL", "0") == "1"
+USE_RAFC = os.environ.get("CALVIN_USE_RAFC", "1") != "0"
+FUTURE_SHIFTS = (-2, 0, 2)
+RAFC_INIT_ALPHA = 0.90
+RAFC_CENTER_LOGIT_BIAS = 3.0
+RAFC_ALPHA_REG = 0.0
+RAFC_ENTROPY_REG = 0.0
+RAFC_ALPHA_TARGET = 0.70
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
@@ -260,6 +268,25 @@ def read_video_frames(path, count, image_size=None):
     return np.stack([frames[int(i)] for i in ids], axis=0)
 
 
+def make_null_future(future_static):
+    future_static = np.asarray(future_static, dtype=np.uint8)
+    return np.repeat(future_static[:1], repeats=future_static.shape[0], axis=0).astype(np.uint8)
+
+
+def shift_future(future_static, shift):
+    future_static = np.asarray(future_static, dtype=np.uint8)
+    t = int(future_static.shape[0])
+    idx = np.arange(t, dtype=np.int32) + int(shift)
+    idx = np.clip(idx, 0, t - 1)
+    return future_static[idx].astype(np.uint8)
+
+
+def make_rafc_future_batch(future_static):
+    futures = [make_null_future(future_static)]
+    futures.extend(shift_future(future_static, shift) for shift in FUTURE_SHIFTS)
+    return np.stack(futures, axis=0).astype(np.uint8)
+
+
 class ResNet18Encoder(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
@@ -363,21 +390,40 @@ class FrozenBCPolicy(object):
     def task_id(self, task_name):
         return int(self.task_to_id[task_name])
 
-    def extract(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
-        obs_static_t = torch.from_numpy(obs_static).unsqueeze(0).to(self.device)
-        obs_gripper_t = torch.from_numpy(obs_gripper).unsqueeze(0).to(self.device)
-        future_static_t = torch.from_numpy(future_static).unsqueeze(0).to(self.device)
-        task_t = torch.tensor([self.task_id(task_name)], dtype=torch.long, device=self.device)
-        goal_t = torch.tensor([int(goal_type)], dtype=torch.long, device=self.device)
+    def extract_many(self, obs_static, obs_gripper, future_static_batch, task_name, goal_type=3):
+        future_static_batch = np.asarray(future_static_batch, dtype=np.uint8)
+        if future_static_batch.ndim == 4:
+            future_static_batch = future_static_batch[None, ...]
+        batch_size = int(future_static_batch.shape[0])
+        obs_static_batch = np.repeat(np.asarray(obs_static, dtype=np.uint8)[None, ...], batch_size, axis=0)
+        obs_gripper_batch = np.repeat(np.asarray(obs_gripper, dtype=np.uint8)[None, ...], batch_size, axis=0)
+
+        obs_static_t = torch.from_numpy(obs_static_batch).to(self.device)
+        obs_gripper_t = torch.from_numpy(obs_gripper_batch).to(self.device)
+        future_static_t = torch.from_numpy(future_static_batch).to(self.device)
+        task_t = torch.full((batch_size,), self.task_id(task_name), dtype=torch.long, device=self.device)
+        goal_t = torch.full((batch_size,), int(goal_type), dtype=torch.long, device=self.device)
         with torch.no_grad():
             z, g_t, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
-        z = z[0]
-        feat = torch.cat([z[0], z.mean(dim=0)], dim=-1).cpu().numpy().astype(np.float32)
-        g_t = g_t[0].cpu().numpy().astype(np.float32)
-        arm_chunk_n = arm_chunk_n[0].cpu().numpy().astype(np.float32)
-        arm_chunk = arm_chunk_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
-        base_grip = 1.0 if float(torch.sigmoid(grip_logits[0, 0]).item()) > 0.5 else -1.0
-        return {"feature": feat, "g_t": g_t, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+
+        feat = torch.cat([z[:, 0], z.mean(dim=1)], dim=-1).cpu().numpy().astype(np.float32)
+        g_t = g_t.cpu().numpy().astype(np.float32)
+        arm0_n = arm_chunk_n[:, 0].cpu().numpy().astype(np.float32)
+        base_arm = arm0_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
+        grip = torch.sigmoid(grip_logits[:, 0]).cpu().numpy()
+        base_grip = np.where(grip > 0.5, 1.0, -1.0).astype(np.float32).reshape(batch_size, 1)
+        base_action = np.concatenate([base_arm[:, :self.arm_dim].astype(np.float32), base_grip], axis=1).astype(np.float32)
+        return {"feature": feat, "g_t": g_t, "base_action": base_action}
+
+    def extract(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
+        batch = self.extract_many(obs_static, obs_gripper, np.asarray(future_static, dtype=np.uint8)[None, ...], task_name, goal_type)
+        base_action = batch["base_action"][0]
+        return {
+            "feature": batch["feature"][0],
+            "g_t": batch["g_t"][0],
+            "base_arm": base_action[:self.arm_dim].astype(np.float32),
+            "base_grip": float(base_action[self.arm_dim]),
+        }
 
     def extract_with_future_latent(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
         base = self.extract(obs_static, obs_gripper, future_static, task_name, goal_type)
@@ -406,6 +452,38 @@ class FineTuningActor(nn.Module):
         return torch.tanh(self.net(x)) * self.limit_vec.to(x.device)
 
 
+class FutureGate(nn.Module):
+    def __init__(self, feature_dim, num_shifts):
+        super().__init__()
+        self.num_shifts = int(num_shifts)
+        self.net = nn.Sequential(
+            nn.Linear(int(feature_dim) * (self.num_shifts + 1), 256), nn.ReLU(inplace=True),
+            nn.Linear(256, 128), nn.ReLU(inplace=True),
+        )
+        self.alpha_head = nn.Linear(128, 1)
+        self.shift_head = nn.Linear(128, self.num_shifts)
+        nn.init.zeros_(self.alpha_head.weight)
+        nn.init.constant_(self.alpha_head.bias, float(np.log(RAFC_INIT_ALPHA / (1.0 - RAFC_INIT_ALPHA))))
+        nn.init.zeros_(self.shift_head.weight)
+        nn.init.zeros_(self.shift_head.bias)
+        self.shift_head.bias.data[self.num_shifts // 2] = RAFC_CENTER_LOGIT_BIAS
+
+    def forward(self, feature_null, feature_candidates):
+        batch_size, num_shifts, feature_dim = feature_candidates.shape
+        x = torch.cat([feature_null, feature_candidates.reshape(batch_size, num_shifts * feature_dim)], dim=-1)
+        h = self.net(x)
+        alpha = torch.sigmoid(self.alpha_head(h))
+        weights = torch.softmax(self.shift_head(h), dim=-1)
+        feature_shift = torch.sum(weights.unsqueeze(-1) * feature_candidates, dim=1)
+        feature_gate = (1.0 - alpha) * feature_null + alpha * feature_shift
+        return feature_gate, alpha, weights
+
+
+def mix_with_gate(alpha, weights, value_null, value_candidates):
+    value_shift = torch.sum(weights.unsqueeze(-1) * value_candidates, dim=1)
+    return (1.0 - alpha) * value_null + alpha * value_shift
+
+
 class CriticQ(nn.Module):
     def __init__(self, feature_dim, g_dim, priv_dim, action_dim):
         super().__init__()
@@ -421,49 +499,134 @@ class CriticQ(nn.Module):
 
 
 class TD3FineTuningAgent(object):
-    def __init__(self, feature_dim, g_dim, priv_dim, action_dim, arm_dim, device):
+    def __init__(self, feature_dim, g_dim, priv_dim, action_dim, arm_dim, device, use_rafc=True):
         self.device = device
         self.feature_dim = int(feature_dim)
         self.g_dim = int(g_dim)
         self.priv_dim = int(priv_dim)
         self.action_dim = int(action_dim)
         self.arm_dim = int(arm_dim)
+        self.use_rafc = bool(use_rafc)
+        self.center_shift_idx = FUTURE_SHIFTS.index(0) if 0 in FUTURE_SHIFTS else len(FUTURE_SHIFTS) // 2
         self.actor = FineTuningActor(feature_dim, g_dim, action_dim, arm_dim, DELTA_ARM_LIMIT, GRIP_DELTA_LIMIT).to(device)
         self.actor_target = deepcopy(self.actor).to(device)
+        self.gate = FutureGate(feature_dim, len(FUTURE_SHIFTS)).to(device) if self.use_rafc else None
+        self.gate_target = deepcopy(self.gate).to(device) if self.use_rafc else None
         self.critic1 = CriticQ(feature_dim, g_dim, priv_dim, action_dim).to(device)
         self.critic2 = CriticQ(feature_dim, g_dim, priv_dim, action_dim).to(device)
         self.critic1_target = deepcopy(self.critic1).to(device)
         self.critic2_target = deepcopy(self.critic2).to(device)
-        self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=ACTOR_LR, weight_decay=WEIGHT_DECAY)
+        self.actor_params = list(self.actor.parameters()) + (list(self.gate.parameters()) if self.use_rafc else [])
+        self.actor_opt = torch.optim.AdamW(self.actor_params, lr=ACTOR_LR, weight_decay=WEIGHT_DECAY)
         self.critic_opt = torch.optim.AdamW(list(self.critic1.parameters()) + list(self.critic2.parameters()), lr=CRITIC_LR, weight_decay=WEIGHT_DECAY)
         self.total_updates = 0
         self.limit_vec_np = np.asarray([DELTA_ARM_LIMIT] * arm_dim + [GRIP_DELTA_LIMIT], dtype=np.float32)
 
-    def act(self, feature_np, g_np, base_action_np, add_noise=True):
-        feature = torch.from_numpy(feature_np).unsqueeze(0).to(self.device)
-        g_t = torch.from_numpy(g_np).unsqueeze(0).to(self.device)
-        base_action = torch.from_numpy(base_action_np).unsqueeze(0).to(self.device)
+    def _apply_gate(self, feature_null, feature_candidates, g_null, g_candidates, base_action_null, base_action_candidates, target=False):
+        if not self.use_rafc:
+            batch_size = int(feature_candidates.shape[0])
+            weights = torch.zeros((batch_size, len(FUTURE_SHIFTS)), dtype=feature_candidates.dtype, device=feature_candidates.device)
+            weights[:, self.center_shift_idx] = 1.0
+            alpha = torch.ones((batch_size, 1), dtype=feature_candidates.dtype, device=feature_candidates.device)
+            return (
+                feature_candidates[:, self.center_shift_idx],
+                g_candidates[:, self.center_shift_idx],
+                base_action_candidates[:, self.center_shift_idx],
+                alpha,
+                weights,
+            )
+        gate = self.gate_target if target else self.gate
+        feature_gate, alpha, weights = gate(feature_null, feature_candidates)
+        g_gate = mix_with_gate(alpha, weights, g_null, g_candidates)
+        base_action_gate = mix_with_gate(alpha, weights, base_action_null, base_action_candidates)
+        return feature_gate, g_gate, base_action_gate, alpha, weights
+
+    def act(self, feature_null_np, g_null_np, base_action_null_np, feature_candidates_np, g_candidates_np, base_action_candidates_np, add_noise=True, return_gate=False):
+        feature_null = torch.from_numpy(feature_null_np).unsqueeze(0).to(self.device)
+        g_null = torch.from_numpy(g_null_np).unsqueeze(0).to(self.device)
+        base_action_null = torch.from_numpy(base_action_null_np).unsqueeze(0).to(self.device)
+        feature_candidates = torch.from_numpy(feature_candidates_np).unsqueeze(0).to(self.device)
+        g_candidates = torch.from_numpy(g_candidates_np).unsqueeze(0).to(self.device)
+        base_action_candidates = torch.from_numpy(base_action_candidates_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
+            feature, g_t, base_action, alpha, weights = self._apply_gate(
+                feature_null,
+                feature_candidates,
+                g_null,
+                g_candidates,
+                base_action_null,
+                base_action_candidates,
+            )
             delta = self.actor(feature, g_t, base_action)[0].cpu().numpy()
+            base_action_np = base_action[0].cpu().numpy().astype(np.float32)
+            alpha_np = alpha[0].cpu().numpy().astype(np.float32)
+            weights_np = weights[0].cpu().numpy().astype(np.float32)
         if add_noise:
             noise = np.random.normal(0.0, EXPL_NOISE_STD, size=delta.shape).astype(np.float32)
             delta = delta + np.clip(noise, -EXPL_NOISE_CLIP, EXPL_NOISE_CLIP)
-        return np.clip(delta, -self.limit_vec_np, self.limit_vec_np).astype(np.float32)
+        delta = np.clip(delta, -self.limit_vec_np, self.limit_vec_np).astype(np.float32)
+        if return_gate:
+            return delta, {"base_action": base_action_np, "alpha": alpha_np, "weights": weights_np}
+        return delta
+
+    def gated_base_action(self, feature_null_np, g_null_np, base_action_null_np, feature_candidates_np, g_candidates_np, base_action_candidates_np):
+        feature_null = torch.from_numpy(feature_null_np).unsqueeze(0).to(self.device)
+        g_null = torch.from_numpy(g_null_np).unsqueeze(0).to(self.device)
+        base_action_null = torch.from_numpy(base_action_null_np).unsqueeze(0).to(self.device)
+        feature_candidates = torch.from_numpy(feature_candidates_np).unsqueeze(0).to(self.device)
+        g_candidates = torch.from_numpy(g_candidates_np).unsqueeze(0).to(self.device)
+        base_action_candidates = torch.from_numpy(base_action_candidates_np).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            _, _, base_action, alpha, weights = self._apply_gate(
+                feature_null,
+                feature_candidates,
+                g_null,
+                g_candidates,
+                base_action_null,
+                base_action_candidates,
+            )
+        return base_action[0].cpu().numpy().astype(np.float32), {
+            "alpha": alpha[0].cpu().numpy().astype(np.float32),
+            "weights": weights[0].cpu().numpy().astype(np.float32),
+        }
 
     def train_step(self, replay, batch_size):
         batch = replay.sample(batch_size)
-        feature = torch.from_numpy(batch["feature"]).to(self.device)
-        g_t = torch.from_numpy(batch["g"]).to(self.device)
+        feature_null = torch.from_numpy(batch["feature_null"]).to(self.device)
+        feature_candidates = torch.from_numpy(batch["feature_candidates"]).to(self.device)
+        g_null = torch.from_numpy(batch["g_null"]).to(self.device)
+        g_candidates = torch.from_numpy(batch["g_candidates"]).to(self.device)
         priv_state = torch.from_numpy(batch["priv_state"]).to(self.device)
-        base_action = torch.from_numpy(batch["base_action"]).to(self.device)
+        base_action_null = torch.from_numpy(batch["base_action_null"]).to(self.device)
+        base_action_candidates = torch.from_numpy(batch["base_action_candidates"]).to(self.device)
         delta_action = torch.from_numpy(batch["delta_action"]).to(self.device)
         reward = torch.from_numpy(batch["reward"]).to(self.device)
-        next_feature = torch.from_numpy(batch["next_feature"]).to(self.device)
-        next_g = torch.from_numpy(batch["next_g"]).to(self.device)
+        next_feature_null = torch.from_numpy(batch["next_feature_null"]).to(self.device)
+        next_feature_candidates = torch.from_numpy(batch["next_feature_candidates"]).to(self.device)
+        next_g_null = torch.from_numpy(batch["next_g_null"]).to(self.device)
+        next_g_candidates = torch.from_numpy(batch["next_g_candidates"]).to(self.device)
         next_priv_state = torch.from_numpy(batch["next_priv_state"]).to(self.device)
-        next_base_action = torch.from_numpy(batch["next_base_action"]).to(self.device)
+        next_base_action_null = torch.from_numpy(batch["next_base_action_null"]).to(self.device)
+        next_base_action_candidates = torch.from_numpy(batch["next_base_action_candidates"]).to(self.device)
         done = torch.from_numpy(batch["done"]).to(self.device)
         with torch.no_grad():
+            feature, g_t, base_action, _, _ = self._apply_gate(
+                feature_null,
+                feature_candidates,
+                g_null,
+                g_candidates,
+                base_action_null,
+                base_action_candidates,
+            )
+            next_feature, next_g, next_base_action, _, _ = self._apply_gate(
+                next_feature_null,
+                next_feature_candidates,
+                next_g_null,
+                next_g_candidates,
+                next_base_action_null,
+                next_base_action_candidates,
+                target=True,
+            )
             noise = torch.randn_like(delta_action) * POLICY_NOISE
             noise = torch.clamp(noise, -NOISE_CLIP, NOISE_CLIP)
             limit_vec = self.actor.limit_vec.to(self.device)
@@ -481,16 +644,32 @@ class TD3FineTuningAgent(object):
         logs = {"critic_loss": float(critic_loss.item()), "q1": float(q1.mean().item())}
         self.total_updates += 1
         if self.total_updates % POLICY_DELAY == 0:
-            delta = self.actor(feature, g_t, base_action)
-            actor_loss = -self.critic1(feature, g_t, priv_state, base_action, delta).mean()
+            feature_pi, g_pi, base_action_pi, alpha, weights = self._apply_gate(
+                feature_null,
+                feature_candidates,
+                g_null,
+                g_candidates,
+                base_action_null,
+                base_action_candidates,
+            )
+            delta = self.actor(feature_pi, g_pi, base_action_pi)
+            actor_loss = -self.critic1(feature_pi, g_pi, priv_state, base_action_pi, delta).mean()
+            entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
+            gate_reg = RAFC_ALPHA_REG * (alpha.mean() - RAFC_ALPHA_TARGET).pow(2) - RAFC_ENTROPY_REG * entropy
+            actor_loss = actor_loss + gate_reg
             self.actor_opt.zero_grad(set_to_none=True)
             actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
+            nn.utils.clip_grad_norm_(self.actor_params, max_norm=5.0)
             self.actor_opt.step()
             self.soft_update(self.actor, self.actor_target)
+            if self.use_rafc:
+                self.soft_update(self.gate, self.gate_target)
             self.soft_update(self.critic1, self.critic1_target)
             self.soft_update(self.critic2, self.critic2_target)
             logs["actor_loss"] = float(actor_loss.item())
+            logs["gate_alpha"] = float(alpha.mean().item())
+            logs["gate_entropy"] = float(entropy.item())
+            logs["gate_weights"] = [float(x) for x in weights.mean(dim=0).detach().cpu().numpy()]
         return logs
 
     def soft_update(self, src, tgt):
@@ -499,8 +678,11 @@ class TD3FineTuningAgent(object):
                 b.data.mul_(1.0 - TAU).add_(TAU * a.data)
 
     def save(self, path):
-        torch.save({
+        ckpt = {
             "actor_state_dict": self.actor.state_dict(),
+            "uses_rafc": self.use_rafc,
+            "future_shifts": list(FUTURE_SHIFTS),
+            "num_future_shifts": len(FUTURE_SHIFTS),
             "feature_dim": self.feature_dim,
             "g_dim": self.g_dim,
             "priv_dim": self.priv_dim,
@@ -508,38 +690,54 @@ class TD3FineTuningAgent(object):
             "arm_dim": self.arm_dim,
             "delta_arm_limit": DELTA_ARM_LIMIT,
             "grip_delta_limit": GRIP_DELTA_LIMIT,
-        }, path)
+        }
+        if self.use_rafc:
+            ckpt["gate_state_dict"] = self.gate.state_dict()
+        torch.save(ckpt, path)
 
 
 class ReplayBuffer(object):
-    def __init__(self, capacity, feature_dim, g_dim, priv_dim, action_dim):
+    def __init__(self, capacity, feature_dim, g_dim, priv_dim, action_dim, num_shifts):
         self.capacity = int(capacity)
-        self.feature = np.zeros((capacity, feature_dim), dtype=np.float32)
-        self.g = np.zeros((capacity, g_dim), dtype=np.float32)
+        self.num_shifts = int(num_shifts)
+        self.feature_null = np.zeros((capacity, feature_dim), dtype=np.float32)
+        self.feature_candidates = np.zeros((capacity, self.num_shifts, feature_dim), dtype=np.float32)
+        self.g_null = np.zeros((capacity, g_dim), dtype=np.float32)
+        self.g_candidates = np.zeros((capacity, self.num_shifts, g_dim), dtype=np.float32)
         self.priv_state = np.zeros((capacity, priv_dim), dtype=np.float32)
-        self.base_action = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.base_action_null = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.base_action_candidates = np.zeros((capacity, self.num_shifts, action_dim), dtype=np.float32)
         self.delta_action = np.zeros((capacity, action_dim), dtype=np.float32)
         self.reward = np.zeros((capacity, 1), dtype=np.float32)
-        self.next_feature = np.zeros((capacity, feature_dim), dtype=np.float32)
-        self.next_g = np.zeros((capacity, g_dim), dtype=np.float32)
+        self.next_feature_null = np.zeros((capacity, feature_dim), dtype=np.float32)
+        self.next_feature_candidates = np.zeros((capacity, self.num_shifts, feature_dim), dtype=np.float32)
+        self.next_g_null = np.zeros((capacity, g_dim), dtype=np.float32)
+        self.next_g_candidates = np.zeros((capacity, self.num_shifts, g_dim), dtype=np.float32)
         self.next_priv_state = np.zeros((capacity, priv_dim), dtype=np.float32)
-        self.next_base_action = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.next_base_action_null = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.next_base_action_candidates = np.zeros((capacity, self.num_shifts, action_dim), dtype=np.float32)
         self.done = np.zeros((capacity, 1), dtype=np.float32)
         self.ptr = 0
         self.size = 0
 
-    def add(self, feature, g_t, priv_state, base_action, delta_action, reward, next_feature, next_g, next_priv_state, next_base_action, done):
+    def add(self, rafc, priv_state, delta_action, reward, next_rafc, next_priv_state, done):
         i = self.ptr
-        self.feature[i] = feature
-        self.g[i] = g_t
+        self.feature_null[i] = rafc["feature_null"]
+        self.feature_candidates[i] = rafc["feature_candidates"]
+        self.g_null[i] = rafc["g_null"]
+        self.g_candidates[i] = rafc["g_candidates"]
         self.priv_state[i] = priv_state
-        self.base_action[i] = base_action
+        self.base_action_null[i] = rafc["base_action_null"]
+        self.base_action_candidates[i] = rafc["base_action_candidates"]
         self.delta_action[i] = delta_action
         self.reward[i, 0] = float(reward)
-        self.next_feature[i] = next_feature
-        self.next_g[i] = next_g
+        self.next_feature_null[i] = next_rafc["feature_null"]
+        self.next_feature_candidates[i] = next_rafc["feature_candidates"]
+        self.next_g_null[i] = next_rafc["g_null"]
+        self.next_g_candidates[i] = next_rafc["g_candidates"]
         self.next_priv_state[i] = next_priv_state
-        self.next_base_action[i] = next_base_action
+        self.next_base_action_null[i] = next_rafc["base_action_null"]
+        self.next_base_action_candidates[i] = next_rafc["base_action_candidates"]
         self.done[i, 0] = float(done)
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -547,16 +745,22 @@ class ReplayBuffer(object):
     def sample(self, batch_size):
         idx = np.random.randint(0, self.size, size=int(batch_size))
         return {
-            "feature": self.feature[idx],
-            "g": self.g[idx],
+            "feature_null": self.feature_null[idx],
+            "feature_candidates": self.feature_candidates[idx],
+            "g_null": self.g_null[idx],
+            "g_candidates": self.g_candidates[idx],
             "priv_state": self.priv_state[idx],
-            "base_action": self.base_action[idx],
+            "base_action_null": self.base_action_null[idx],
+            "base_action_candidates": self.base_action_candidates[idx],
             "delta_action": self.delta_action[idx],
             "reward": self.reward[idx],
-            "next_feature": self.next_feature[idx],
-            "next_g": self.next_g[idx],
+            "next_feature_null": self.next_feature_null[idx],
+            "next_feature_candidates": self.next_feature_candidates[idx],
+            "next_g_null": self.next_g_null[idx],
+            "next_g_candidates": self.next_g_candidates[idx],
             "next_priv_state": self.next_priv_state[idx],
-            "next_base_action": self.next_base_action[idx],
+            "next_base_action_null": self.next_base_action_null[idx],
+            "next_base_action_candidates": self.next_base_action_candidates[idx],
             "done": self.done[idx],
         }
 
@@ -749,6 +953,25 @@ def to_base_action(base):
     return np.concatenate([base["base_arm"][:ARM_ACTION_DIM], np.asarray([base["base_grip"]], dtype=np.float32)], axis=0).astype(np.float32)
 
 
+def extract_rafc_inputs(base_policy, pi):
+    future_batch = make_rafc_future_batch(pi["future_static"])
+    batch = base_policy.extract_many(
+        pi["obs_static"],
+        pi["obs_gripper"],
+        future_batch,
+        pi["task"],
+        pi["goal_type"],
+    )
+    return {
+        "feature_null": batch["feature"][0].astype(np.float32),
+        "feature_candidates": batch["feature"][1:].astype(np.float32),
+        "g_null": batch["g_t"][0].astype(np.float32),
+        "g_candidates": batch["g_t"][1:].astype(np.float32),
+        "base_action_null": batch["base_action"][0].astype(np.float32),
+        "base_action_candidates": batch["base_action"][1:].astype(np.float32),
+    }
+
+
 def eval_agent(env, base_policy, agent, num_eps):
     successes = 0
     rows = []
@@ -759,9 +982,18 @@ def eval_agent(env, base_policy, agent, num_eps):
         step = 0
         last = info
         while not done and not trunc:
-            base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
-            base_action = to_base_action(base)
-            delta = agent.act(base["feature"], base["g_t"], base_action, add_noise=False)
+            rafc = extract_rafc_inputs(base_policy, pi)
+            delta, gate_info = agent.act(
+                rafc["feature_null"],
+                rafc["g_null"],
+                rafc["base_action_null"],
+                rafc["feature_candidates"],
+                rafc["g_candidates"],
+                rafc["base_action_candidates"],
+                add_noise=False,
+                return_gate=True,
+            )
+            base_action = gate_info["base_action"]
             full_action = env._compose_full_action(base_action, delta)
             pi, _, done, trunc, last = env.step(full_action, delta)
             step += 1
@@ -788,12 +1020,14 @@ def main():
     eval_env = CalvinFineTuningEnv(eval_segments, SHOW_GUI_EVAL, SEED + 999, base_policy, cache, fixed_order=True)
 
     pi, info = train_env.reset(seed=SEED)
-    base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
-    feature_dim = int(base["feature"].shape[0])
-    g_dim = int(base["g_t"].shape[0])
+    rafc = extract_rafc_inputs(base_policy, pi)
+    feature_dim = int(rafc["feature_null"].shape[0])
+    g_dim = int(rafc["g_null"].shape[0])
     priv_dim = int(pi["priv_state"].shape[0])
-    replay = ReplayBuffer(BUFFER_SIZE, feature_dim, g_dim, priv_dim, ACTION_DIM)
-    agent = TD3FineTuningAgent(feature_dim, g_dim, priv_dim, ACTION_DIM, ARM_ACTION_DIM, DEVICE)
+    replay = ReplayBuffer(BUFFER_SIZE, feature_dim, g_dim, priv_dim, ACTION_DIM, len(FUTURE_SHIFTS))
+    agent = TD3FineTuningAgent(feature_dim, g_dim, priv_dim, ACTION_DIM, ARM_ACTION_DIM, DEVICE, use_rafc=USE_RAFC)
+    print("future_source={}".format("generated" if USE_GENERATED_FUTURES_DURING_RL else "demo"))
+    print("use_rafc={} future_shifts={}".format(bool(USE_RAFC), list(FUTURE_SHIFTS)))
 
     history = []
     best_success = -1.0
@@ -803,30 +1037,41 @@ def main():
     recent_success = deque(maxlen=20)
 
     for env_step in range(1, TOTAL_ENV_STEPS + 1):
-        base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
-        base_action = to_base_action(base)
         if env_step <= RANDOM_WARMUP_STEPS:
+            base_action, _ = agent.gated_base_action(
+                rafc["feature_null"],
+                rafc["g_null"],
+                rafc["base_action_null"],
+                rafc["feature_candidates"],
+                rafc["g_candidates"],
+                rafc["base_action_candidates"],
+            )
             limit_vec = np.asarray([DELTA_ARM_LIMIT] * ARM_ACTION_DIM + [GRIP_DELTA_LIMIT], dtype=np.float32)
             delta = np.random.uniform(low=-limit_vec, high=limit_vec).astype(np.float32)
         else:
-            delta = agent.act(base["feature"], base["g_t"], base_action, add_noise=True)
+            delta, gate_info = agent.act(
+                rafc["feature_null"],
+                rafc["g_null"],
+                rafc["base_action_null"],
+                rafc["feature_candidates"],
+                rafc["g_candidates"],
+                rafc["base_action_candidates"],
+                add_noise=True,
+                return_gate=True,
+            )
+            base_action = gate_info["base_action"]
         full_action = train_env._compose_full_action(base_action, delta)
         next_pi, reward, done, truncated, step_info = train_env.step(full_action, delta)
         terminal = bool(done or truncated)
 
         if next_pi is None:
-            next_feature = base["feature"].copy()
-            next_g = base["g_t"].copy()
-            next_base_action = base_action.copy()
+            next_rafc = rafc
             next_priv = pi["priv_state"].copy()
         else:
-            next_base = base_policy.extract(next_pi["obs_static"], next_pi["obs_gripper"], next_pi["future_static"], next_pi["task"], next_pi["goal_type"])
-            next_feature = next_base["feature"].copy()
-            next_g = next_base["g_t"].copy()
-            next_base_action = to_base_action(next_base)
+            next_rafc = extract_rafc_inputs(base_policy, next_pi)
             next_priv = next_pi["priv_state"].copy()
 
-        replay.add(base["feature"], base["g_t"], pi["priv_state"], base_action, delta, reward, next_feature, next_g, next_priv, next_base_action, float(terminal))
+        replay.add(rafc, pi["priv_state"], delta, reward, next_rafc, next_priv, float(terminal))
         episode_reward += float(reward)
         episode_steps += 1
 
@@ -840,10 +1085,12 @@ def main():
             recent_success.append(float(step_info.get("success", False)))
             print("ep {:04d} step {} task={} return={:.2f} success={} steps={}".format(episode_count, env_step, step_info.get("task", ""), episode_reward, bool(step_info.get("success", False)), episode_steps))
             pi, info = train_env.reset(seed=SEED + episode_count)
+            rafc = extract_rafc_inputs(base_policy, pi)
             episode_reward = 0.0
             episode_steps = 0
         else:
             pi = next_pi
+            rafc = next_rafc
 
         if env_step % EVAL_EVERY_STEPS == 0:
             rate, rows = eval_agent(eval_env, base_policy, agent, NUM_EVAL_EPISODES)

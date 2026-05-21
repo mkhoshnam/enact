@@ -45,6 +45,12 @@ FINE_TUNING_ACTOR_PATH = OUT_BASE / "calvin_fine_tuning_rl" / "fine_tuning_actor
 FUTURE_VIDEO_ROOT = Path("/path/to/generated_inpainted_calvin_futures")
 ONTOLOGY_PATH = OUT_BASE / "ontology" / "calvin_task_ontology.json"
 OUTPUT_DIR = OUT_BASE / "llm_future_policy_runs"
+FUTURE_SHIFTS = (-2, 0, 2)
+RAFC_INIT_ALPHA = 0.90
+RAFC_CENTER_LOGIT_BIAS = 3.0
+FUTURE_EVAL_MODE = os.environ.get("CALVIN_FUTURE_MODE", "generated").lower()
+FUTURE_EVAL_SHIFT = int(os.environ.get("CALVIN_FUTURE_SHIFT", "0"))
+WRONG_FUTURE_VIDEO_PATH = os.environ.get("CALVIN_WRONG_FUTURE_VIDEO_PATH", "")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
@@ -201,6 +207,33 @@ def read_future_video(path, count, image_size=None):
     ids = np.linspace(0, len(frames) - 1, num=count)
     ids = np.rint(ids).astype(np.int32)
     return np.stack([frames[int(i)] for i in ids], axis=0)
+
+
+def make_null_future(future_static):
+    future_static = np.asarray(future_static, dtype=np.uint8)
+    return np.repeat(future_static[:1], repeats=future_static.shape[0], axis=0).astype(np.uint8)
+
+
+def shift_future(future_static, shift):
+    future_static = np.asarray(future_static, dtype=np.uint8)
+    t = int(future_static.shape[0])
+    idx = np.arange(t, dtype=np.int32) + int(shift)
+    idx = np.clip(idx, 0, t - 1)
+    return future_static[idx].astype(np.uint8)
+
+
+def make_rafc_future_batch(future_static):
+    futures = [make_null_future(future_static)]
+    futures.extend(shift_future(future_static, shift) for shift in FUTURE_SHIFTS)
+    return np.stack(futures, axis=0).astype(np.uint8)
+
+
+def apply_future_eval_mode(future_static):
+    if FUTURE_EVAL_MODE in ("null", "nofuture"):
+        return make_null_future(future_static)
+    if FUTURE_EVAL_MODE in ("shift", "temporal_shift", "temporalshift"):
+        return shift_future(future_static, FUTURE_EVAL_SHIFT)
+    return np.asarray(future_static, dtype=np.uint8)
 
 
 def write_video(frames, path, fps):
@@ -477,22 +510,40 @@ class FrozenBCPolicy(object):
         for pth in self.model.parameters():
             pth.requires_grad = False
 
-    def extract(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
+    def extract_many(self, obs_static, obs_gripper, future_static_batch, task_name, goal_type=3):
+        future_static_batch = np.asarray(future_static_batch, dtype=np.uint8)
+        if future_static_batch.ndim == 4:
+            future_static_batch = future_static_batch[None, ...]
+        batch_size = int(future_static_batch.shape[0])
         task_id = int(self.task_to_id[task_name])
-        obs_static_t = torch.from_numpy(obs_static).unsqueeze(0).to(self.device)
-        obs_gripper_t = torch.from_numpy(obs_gripper).unsqueeze(0).to(self.device)
-        future_static_t = torch.from_numpy(future_static).unsqueeze(0).to(self.device)
-        task_t = torch.tensor([task_id], dtype=torch.long, device=self.device)
-        goal_t = torch.tensor([int(goal_type)], dtype=torch.long, device=self.device)
+        obs_static_batch = np.repeat(np.asarray(obs_static, dtype=np.uint8)[None, ...], batch_size, axis=0)
+        obs_gripper_batch = np.repeat(np.asarray(obs_gripper, dtype=np.uint8)[None, ...], batch_size, axis=0)
+        obs_static_t = torch.from_numpy(obs_static_batch).to(self.device)
+        obs_gripper_t = torch.from_numpy(obs_gripper_batch).to(self.device)
+        future_static_t = torch.from_numpy(future_static_batch).to(self.device)
+        task_t = torch.full((batch_size,), task_id, dtype=torch.long, device=self.device)
+        goal_t = torch.full((batch_size,), int(goal_type), dtype=torch.long, device=self.device)
         with torch.no_grad():
             z, g_t, arm_chunk_n, grip_logits = self.model.forward_with_latent(obs_static_t, obs_gripper_t, future_static_t, task_t, goal_t)
-        z = z[0]
-        feat = torch.cat([z[0], z.mean(dim=0)], dim=-1).cpu().numpy().astype(np.float32)
-        g_t = g_t[0].cpu().numpy().astype(np.float32)
-        arm_chunk_n = arm_chunk_n[0].cpu().numpy().astype(np.float32)
-        arm_chunk = arm_chunk_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
-        base_grip = 1.0 if float(torch.sigmoid(grip_logits[0, 0]).item()) > 0.5 else -1.0
-        return {"feature": feat, "g_t": g_t, "base_arm": arm_chunk[0].astype(np.float32), "base_grip": float(base_grip)}
+
+        feat = torch.cat([z[:, 0], z.mean(dim=1)], dim=-1).cpu().numpy().astype(np.float32)
+        g_t = g_t.cpu().numpy().astype(np.float32)
+        arm0_n = arm_chunk_n[:, 0].cpu().numpy().astype(np.float32)
+        base_arm = arm0_n * self.arm_action_std[None, :] + self.arm_action_mean[None, :]
+        grip = torch.sigmoid(grip_logits[:, 0]).cpu().numpy()
+        base_grip = np.where(grip > 0.5, 1.0, -1.0).astype(np.float32).reshape(batch_size, 1)
+        base_action = np.concatenate([base_arm[:, :self.arm_dim].astype(np.float32), base_grip], axis=1).astype(np.float32)
+        return {"feature": feat, "g_t": g_t, "base_action": base_action}
+
+    def extract(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
+        batch = self.extract_many(obs_static, obs_gripper, np.asarray(future_static, dtype=np.uint8)[None, ...], task_name, goal_type)
+        base_action = batch["base_action"][0]
+        return {
+            "feature": batch["feature"][0],
+            "g_t": batch["g_t"][0],
+            "base_arm": base_action[:self.arm_dim].astype(np.float32),
+            "base_grip": float(base_action[self.arm_dim]),
+        }
 
     def extract_with_future_latent(self, obs_static, obs_gripper, future_static, task_name, goal_type=3):
         base = self.extract(obs_static, obs_gripper, future_static, task_name, goal_type)
@@ -517,6 +568,38 @@ class FineTuningActor(nn.Module):
         return torch.tanh(self.net(x)) * self.limit_vec.to(x.device)
 
 
+class FutureGate(nn.Module):
+    def __init__(self, feature_dim, num_shifts):
+        super().__init__()
+        self.num_shifts = int(num_shifts)
+        self.net = nn.Sequential(
+            nn.Linear(int(feature_dim) * (self.num_shifts + 1), 256), nn.ReLU(inplace=True),
+            nn.Linear(256, 128), nn.ReLU(inplace=True),
+        )
+        self.alpha_head = nn.Linear(128, 1)
+        self.shift_head = nn.Linear(128, self.num_shifts)
+        nn.init.zeros_(self.alpha_head.weight)
+        nn.init.constant_(self.alpha_head.bias, float(np.log(RAFC_INIT_ALPHA / (1.0 - RAFC_INIT_ALPHA))))
+        nn.init.zeros_(self.shift_head.weight)
+        nn.init.zeros_(self.shift_head.bias)
+        self.shift_head.bias.data[self.num_shifts // 2] = RAFC_CENTER_LOGIT_BIAS
+
+    def forward(self, feature_null, feature_candidates):
+        batch_size, num_shifts, feature_dim = feature_candidates.shape
+        x = torch.cat([feature_null, feature_candidates.reshape(batch_size, num_shifts * feature_dim)], dim=-1)
+        h = self.net(x)
+        alpha = torch.sigmoid(self.alpha_head(h))
+        weights = torch.softmax(self.shift_head(h), dim=-1)
+        feature_shift = torch.sum(weights.unsqueeze(-1) * feature_candidates, dim=1)
+        feature_gate = (1.0 - alpha) * feature_null + alpha * feature_shift
+        return feature_gate, alpha, weights
+
+
+def mix_with_gate(alpha, weights, value_null, value_candidates):
+    value_shift = torch.sum(weights.unsqueeze(-1) * value_candidates, dim=1)
+    return (1.0 - alpha) * value_null + alpha * value_shift
+
+
 class FineTuningActorWrapper(object):
     def __init__(self, ckpt_path, device):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -530,6 +613,14 @@ class FineTuningActorWrapper(object):
         self.actor = FineTuningActor(self.feature_dim, self.g_dim, self.action_dim, self.arm_dim, self.arm_limit, self.grip_limit).to(device)
         self.actor.load_state_dict(ckpt["actor_state_dict"])
         self.actor.eval()
+        self.uses_rafc = bool(ckpt.get("uses_rafc", "gate_state_dict" in ckpt))
+        self.future_shifts = tuple(ckpt.get("future_shifts", FUTURE_SHIFTS))
+        self.gate = None
+        if self.uses_rafc:
+            num_shifts = int(ckpt.get("num_future_shifts", len(self.future_shifts)))
+            self.gate = FutureGate(self.feature_dim, num_shifts).to(device)
+            self.gate.load_state_dict(ckpt["gate_state_dict"])
+            self.gate.eval()
         self.limit_vec_np = np.asarray([self.arm_limit] * self.arm_dim + [self.grip_limit], dtype=np.float32)
 
     def act(self, feature_np, g_np, base_action_np):
@@ -542,6 +633,26 @@ class FineTuningActorWrapper(object):
         with torch.no_grad():
             delta = self.actor(feature, g_t, base_action)[0].cpu().numpy()
         return np.clip(delta, -self.limit_vec_np, self.limit_vec_np).astype(np.float32)
+
+    def act_rafc(self, rafc):
+        if self.gate is None:
+            raise RuntimeError("RAFC checkpoint expected gate_state_dict, but no gate was loaded")
+        feature_null = torch.from_numpy(rafc["feature_null"]).unsqueeze(0).to(self.device)
+        feature_candidates = torch.from_numpy(rafc["feature_candidates"]).unsqueeze(0).to(self.device)
+        g_null = torch.from_numpy(rafc["g_null"]).unsqueeze(0).to(self.device)
+        g_candidates = torch.from_numpy(rafc["g_candidates"]).unsqueeze(0).to(self.device)
+        base_action_null = torch.from_numpy(rafc["base_action_null"]).unsqueeze(0).to(self.device)
+        base_action_candidates = torch.from_numpy(rafc["base_action_candidates"]).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            feature, alpha, weights = self.gate(feature_null, feature_candidates)
+            g_t = mix_with_gate(alpha, weights, g_null, g_candidates)
+            base_action = mix_with_gate(alpha, weights, base_action_null, base_action_candidates)
+            delta = self.actor(feature, g_t, base_action)[0].cpu().numpy()
+        return np.clip(delta, -self.limit_vec_np, self.limit_vec_np).astype(np.float32), {
+            "base_action": base_action[0].cpu().numpy().astype(np.float32),
+            "alpha": alpha[0].cpu().numpy().astype(np.float32),
+            "weights": weights[0].cpu().numpy().astype(np.float32),
+        }
 
 
 class LLMFuturePolicyRunner(object):
@@ -559,7 +670,9 @@ class LLMFuturePolicyRunner(object):
         self.obs_static_hist = deque(maxlen=base_policy.obs_horizon)
         self.obs_gripper_hist = deque(maxlen=base_policy.obs_horizon)
         self.last_obs = None
-        self.future_static = read_future_video(plan["generated_video_path"], base_policy.future_horizon, IMAGE_SIZE)
+        future_path = WRONG_FUTURE_VIDEO_PATH if FUTURE_EVAL_MODE == "wrong" and WRONG_FUTURE_VIDEO_PATH else plan["generated_video_path"]
+        self.future_static = apply_future_eval_mode(read_future_video(future_path, base_policy.future_horizon, IMAGE_SIZE))
+        self.future_path = future_path
 
     def _ensure_env(self):
         if self.env is None:
@@ -635,6 +748,25 @@ def to_base_action(base):
     return np.concatenate([base["base_arm"][:ARM_ACTION_DIM], np.asarray([base["base_grip"]], dtype=np.float32)], axis=0).astype(np.float32)
 
 
+def extract_rafc_inputs(base_policy, pi):
+    future_batch = make_rafc_future_batch(pi["future_static"])
+    batch = base_policy.extract_many(
+        pi["obs_static"],
+        pi["obs_gripper"],
+        future_batch,
+        pi["task"],
+        pi["goal_type"],
+    )
+    return {
+        "feature_null": batch["feature"][0].astype(np.float32),
+        "feature_candidates": batch["feature"][1:].astype(np.float32),
+        "g_null": batch["g_t"][0].astype(np.float32),
+        "g_candidates": batch["g_t"][1:].astype(np.float32),
+        "base_action_null": batch["base_action"][0].astype(np.float32),
+        "base_action_candidates": batch["base_action"][1:].astype(np.float32),
+    }
+
+
 def main():
     set_seed(SEED)
     ensure_dir(OUTPUT_DIR)
@@ -666,9 +798,11 @@ def main():
         json.dump({"command": command, "ontology_path": str(ONTOLOGY_PATH), "plan": plan}, f, indent=2)
 
     print("task:", plan["task_key"])
-    print("future:", plan["generated_video_path"])
 
     runner = LLMFuturePolicyRunner(eval_segments, base_policy, fine_tuning_actor, cache, plan)
+    print("policy:", "RAFC" if fine_tuning_actor.uses_rafc else "single-future")
+    print("future:", runner.future_path)
+    print("future_mode:", FUTURE_EVAL_MODE)
     results = []
     try:
         for ep in range(NUM_EPISODES):
@@ -681,10 +815,19 @@ def main():
             env_done = False
             steps = 0
             last_info = info
+            gate_alphas = []
+            gate_weights = []
             while not success and not env_done and steps < MAX_EPISODE_STEPS:
-                base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
-                base_action = to_base_action(base)
-                delta = fine_tuning_actor.act(base["feature"], base["g_t"], base_action)
+                if fine_tuning_actor.uses_rafc:
+                    rafc = extract_rafc_inputs(base_policy, pi)
+                    delta, gate_info = fine_tuning_actor.act_rafc(rafc)
+                    base_action = gate_info["base_action"]
+                    gate_alphas.append(float(gate_info["alpha"].mean()))
+                    gate_weights.append(gate_info["weights"])
+                else:
+                    base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
+                    base_action = to_base_action(base)
+                    delta = fine_tuning_actor.act(base["feature"], base["g_t"], base_action)
                 action = runner.compose_action(base_action, delta)
                 pi, success, env_done, last_info = runner.step(action)
                 steps += 1
@@ -692,6 +835,9 @@ def main():
                 if fr is not None:
                     frames.append(fr)
             row = {"episode": ep + 1, "task": plan["task_key"], "success": bool(success), "steps": int(steps), "segment_id": int(last_info.get("segment_id", -1))}
+            if gate_alphas:
+                row["gate_alpha"] = float(np.mean(gate_alphas))
+                row["gate_weights"] = [float(x) for x in np.mean(np.stack(gate_weights, axis=0), axis=0)]
             results.append(row)
             print("ep {:02d} task={} success={} steps={}".format(ep + 1, plan["task_key"], success, steps))
             if SAVE_VIDEO and len(frames) > 0:
@@ -707,6 +853,10 @@ def main():
         "command": command,
         "ontology_path": str(ONTOLOGY_PATH),
         "plan": plan,
+        "uses_rafc": bool(fine_tuning_actor.uses_rafc),
+        "future_shifts": list(FUTURE_SHIFTS),
+        "future_mode": FUTURE_EVAL_MODE,
+        "future_shift": FUTURE_EVAL_SHIFT,
         "num_episodes": NUM_EPISODES,
         "success_rate": float(sum(int(r["success"]) for r in results) / max(len(results), 1)),
         "results": results,
