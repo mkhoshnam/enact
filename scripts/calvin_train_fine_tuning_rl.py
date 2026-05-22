@@ -357,17 +357,22 @@ class ResNet18Encoder(nn.Module):
 
 
 class FutureBC(nn.Module):
-    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True):
+    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True, future_bins=4):
         super().__init__()
         self.arm_dim = int(arm_dim)
         self.chunk_horizon = int(chunk_horizon)
         self.obs_horizon = int(obs_horizon)
         self.future_horizon = int(future_horizon)
+        self.future_bins = int(future_bins)
         self.num_tasks = int(num_tasks)
         self.image_encoder = ResNet18Encoder(pretrained=pretrained_backbone)
         self.image_proj = nn.Linear(self.image_encoder.out_dim, hidden_dim)
         self.task_emb = nn.Embedding(num_tasks, hidden_dim)
         self.goal_emb = nn.Embedding(4, hidden_dim)
+        self.future_pool_proj = nn.Sequential(
+            nn.Linear(hidden_dim * self.future_bins, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
         self.action_queries = nn.Parameter(torch.zeros(1, self.chunk_horizon, hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
         total_tokens = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon + self.future_horizon
@@ -405,7 +410,14 @@ class FutureBC(nn.Module):
         x = self.output_norm(self.transformer(self.input_norm(x)))
         future_start = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon
         action_latent = x[:, :self.chunk_horizon]
-        future_latent = x[:, future_start:future_start + self.future_horizon].mean(dim=1)
+        future_tokens = x[:, future_start:future_start + self.future_horizon]
+        future_bins = F.adaptive_avg_pool1d(
+            future_tokens.transpose(1, 2),
+            self.future_bins,
+        ).transpose(1, 2)
+        future_latent = self.future_pool_proj(
+            future_bins.reshape(bsz, -1)
+        )
         return action_latent, future_latent
 
     def forward_with_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
@@ -424,6 +436,7 @@ class FrozenBCPolicy(object):
         self.chunk_horizon = int(cfg["chunk_horizon"])
         self.obs_horizon = int(cfg["obs_horizon"])
         self.future_horizon = int(cfg["future_horizon"])
+        self.future_bins = int(cfg.get("future_bins", 4))
         self.arm_action_mean = np.asarray(ckpt["arm_action_mean"], dtype=np.float32)
         self.arm_action_std = np.asarray(ckpt["arm_action_std"], dtype=np.float32)
         self.model = FutureBC(
@@ -438,6 +451,7 @@ class FrozenBCPolicy(object):
             dropout=float(cfg["dropout"]),
             ff_mult=int(cfg["ff_mult"]),
             pretrained_backbone=True,
+            future_bins=self.future_bins,
         )
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.to(device).eval()
@@ -1088,7 +1102,13 @@ def main():
     print("future_source={}".format("generated" if USE_GENERATED_FUTURES_DURING_RL else "demo"))
     print("use_rafc={} future_shifts={}".format(bool(USE_RAFC), list(FUTURE_SHIFTS)))
 
-    history = []
+    first_reach = {
+        "70": None,
+        "80": None,
+        "best_success": 0.0,
+        "best_step": 0,
+    }
+    history = {"evals": [], "first_reach": first_reach}
     best_success = -1.0
     episode_reward = 0.0
     episode_steps = 0
@@ -1153,8 +1173,24 @@ def main():
 
         if env_step % EVAL_EVERY_STEPS == 0:
             rate, rows = eval_agent(eval_env, base_policy, agent, NUM_EVAL_EPISODES)
-            row = {"env_step": env_step, "success_rate": rate, "recent_success": float(np.mean(recent_success)) if len(recent_success) else 0.0, "eval": rows, "logs": logs}
-            history.append(row)
+            success_percent = float(rate * 100.0)
+            if first_reach["70"] is None and success_percent >= 70.0:
+                first_reach["70"] = int(env_step)
+            if first_reach["80"] is None and success_percent >= 80.0:
+                first_reach["80"] = int(env_step)
+            if success_percent > first_reach["best_success"]:
+                first_reach["best_success"] = success_percent
+                first_reach["best_step"] = int(env_step)
+            row = {
+                "env_step": env_step,
+                "success_rate": rate,
+                "success_percent": success_percent,
+                "recent_success": float(np.mean(recent_success)) if len(recent_success) else 0.0,
+                "eval": rows,
+                "logs": logs,
+            }
+            history["evals"].append(row)
+            history["first_reach"] = first_reach
             with open(HISTORY_JSON, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
             print("eval step {} success {:.3f}".format(env_step, rate))

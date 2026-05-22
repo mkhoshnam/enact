@@ -29,6 +29,7 @@ import hydra
 import pybullet as p
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torchvision.models import ResNet18_Weights, resnet18
 
@@ -81,6 +82,7 @@ OUTPUT_DIR = env_path("CALVIN_INFERENCE_OUTPUT_DIR", OUT_BASE / "llm_future_poli
 FUTURE_SHIFTS = (-2, 0, 2)
 RAFC_INIT_ALPHA = 0.90
 RAFC_CENTER_LOGIT_BIAS = 3.0
+FUTURE_SOURCE = os.environ.get("CALVIN_FUTURE_SOURCE", "generated").strip().lower()
 FUTURE_EVAL_MODE = os.environ.get("CALVIN_FUTURE_MODE", "generated").lower()
 FUTURE_EVAL_SHIFT = int(os.environ.get("CALVIN_FUTURE_SHIFT", "0"))
 WRONG_FUTURE_VIDEO_PATH = os.environ.get("CALVIN_WRONG_FUTURE_VIDEO_PATH", "")
@@ -302,6 +304,13 @@ def make_null_future(future_static):
     return np.repeat(future_static[:1], repeats=future_static.shape[0], axis=0).astype(np.uint8)
 
 
+def make_null_future_clip(current_obs_static, count):
+    frame = np.asarray(current_obs_static, dtype=np.uint8)
+    if frame.ndim == 4:
+        frame = frame[-1]
+    return np.repeat(frame[None, ...], repeats=int(count), axis=0).astype(np.uint8)
+
+
 def shift_future(future_static, shift):
     future_static = np.asarray(future_static, dtype=np.uint8)
     t = int(future_static.shape[0])
@@ -519,17 +528,22 @@ class ResNet18Encoder(nn.Module):
 
 
 class FutureBC(nn.Module):
-    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True):
+    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True, future_bins=4):
         super().__init__()
         self.arm_dim = int(arm_dim)
         self.chunk_horizon = int(chunk_horizon)
         self.obs_horizon = int(obs_horizon)
         self.future_horizon = int(future_horizon)
+        self.future_bins = int(future_bins)
         self.num_tasks = int(num_tasks)
         self.image_encoder = ResNet18Encoder(pretrained=pretrained_backbone)
         self.image_proj = nn.Linear(self.image_encoder.out_dim, hidden_dim)
         self.task_emb = nn.Embedding(num_tasks, hidden_dim)
         self.goal_emb = nn.Embedding(4, hidden_dim)
+        self.future_pool_proj = nn.Sequential(
+            nn.Linear(hidden_dim * self.future_bins, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
         self.action_queries = nn.Parameter(torch.zeros(1, self.chunk_horizon, hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
         total_tokens = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon + self.future_horizon
@@ -566,7 +580,14 @@ class FutureBC(nn.Module):
         x = self.output_norm(self.transformer(self.input_norm(x)))
         future_start = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon
         action_latent = x[:, :self.chunk_horizon]
-        future_latent = x[:, future_start:future_start + self.future_horizon].mean(dim=1)
+        future_tokens = x[:, future_start:future_start + self.future_horizon]
+        future_bins = F.adaptive_avg_pool1d(
+            future_tokens.transpose(1, 2),
+            self.future_bins,
+        ).transpose(1, 2)
+        future_latent = self.future_pool_proj(
+            future_bins.reshape(bsz, -1)
+        )
         return action_latent, future_latent
 
     def forward_with_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
@@ -585,6 +606,7 @@ class FrozenBCPolicy(object):
         self.chunk_horizon = int(cfg["chunk_horizon"])
         self.obs_horizon = int(cfg["obs_horizon"])
         self.future_horizon = int(cfg["future_horizon"])
+        self.future_bins = int(cfg.get("future_bins", 4))
         self.arm_action_mean = np.asarray(ckpt["arm_action_mean"], dtype=np.float32)
         self.arm_action_std = np.asarray(ckpt["arm_action_std"], dtype=np.float32)
         self.model = FutureBC(
@@ -599,6 +621,7 @@ class FrozenBCPolicy(object):
             dropout=float(cfg["dropout"]),
             ff_mult=int(cfg["ff_mult"]),
             pretrained_backbone=True,
+            future_bins=self.future_bins,
         )
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.to(device).eval()
@@ -768,8 +791,9 @@ class LLMFuturePolicyRunner(object):
         future_path = WRONG_FUTURE_VIDEO_PATH if FUTURE_EVAL_MODE == "wrong" and WRONG_FUTURE_VIDEO_PATH else plan["generated_video_path"]
         self.future_path = resolve_future_video_path(self.task, future_path)
         self.generated_future_static = None
-        if self.future_path.exists():
+        if FUTURE_SOURCE == "generated" and self.future_path.exists():
             self.generated_future_static = apply_future_eval_mode(read_future_video(self.future_path, base_policy.future_horizon, IMAGE_SIZE))
+        self.warned_missing_generated = False
         self.future_static = None
 
     def _ensure_env(self):
@@ -793,14 +817,24 @@ class LLMFuturePolicyRunner(object):
             axis=0,
         )
 
+    def _select_future(self, start_idx, init_static):
+        if FUTURE_SOURCE == "generated":
+            if self.generated_future_static is not None:
+                return self.generated_future_static
+            if not self.warned_missing_generated:
+                print("[WARN] Generated future missing; falling back to demo future.")
+                self.warned_missing_generated = True
+            return apply_future_eval_mode(self._demo_future(start_idx))
+        if FUTURE_SOURCE == "demo":
+            return apply_future_eval_mode(self._demo_future(start_idx))
+        if FUTURE_SOURCE == "null":
+            return make_null_future_clip(init_static, self.base_policy.future_horizon)
+        raise ValueError("Unknown FUTURE_SOURCE: {}".format(FUTURE_SOURCE))
+
     def reset(self, episode_id):
         self._ensure_env()
         self.current_segment = self._segment_for_task(episode_id)
         start_idx = int(self.current_segment["global_start_idx"])
-        if self.generated_future_static is None:
-            self.future_static = apply_future_eval_mode(self._demo_future(start_idx))
-        else:
-            self.future_static = self.generated_future_static
         item = self.cache.get(start_idx)
         obs = self.env.reset(robot_obs=np.asarray(item["robot_obs"], dtype=np.float32), scene_obs=np.asarray(item["scene_obs"], dtype=np.float32))
         self.start_info = self.env.get_info()
@@ -809,6 +843,7 @@ class LLMFuturePolicyRunner(object):
         self.obs_gripper_hist.clear()
         init_static = resize_if_needed(get_u8(obs, "rgb_static"), IMAGE_SIZE)
         init_gripper = resize_if_needed(get_u8(obs, "rgb_gripper"), IMAGE_SIZE)
+        self.future_static = self._select_future(start_idx, init_static)
         for _ in range(self.base_policy.obs_horizon):
             self.obs_static_hist.append(init_static.copy())
             self.obs_gripper_hist.append(init_gripper.copy())
@@ -918,6 +953,7 @@ def main():
 
     runner = LLMFuturePolicyRunner(eval_segments, base_policy, fine_tuning_actor, cache, plan)
     print("policy:", "RAFC" if fine_tuning_actor.uses_rafc else "single-future")
+    print("future_source:", FUTURE_SOURCE)
     print("future:", runner.future_path)
     print("future_mode:", FUTURE_EVAL_MODE)
     results = []
@@ -971,6 +1007,7 @@ def main():
         "ontology_path": str(ONTOLOGY_PATH),
         "plan": plan,
         "uses_rafc": bool(fine_tuning_actor.uses_rafc),
+        "future_source": FUTURE_SOURCE,
         "future_shifts": list(FUTURE_SHIFTS),
         "future_mode": FUTURE_EVAL_MODE,
         "future_shift": FUTURE_EVAL_SHIFT,

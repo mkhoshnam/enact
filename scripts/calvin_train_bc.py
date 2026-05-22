@@ -45,6 +45,7 @@ NUM_LAYERS = 4
 NUM_HEADS = 8
 DROPOUT = 0.10
 FF_MULT = 4
+FUTURE_BINS = 4
 GRIPPER_LOSS_WEIGHT = 0.25
 PROGRESS_LOSS_WEIGHT = 0.35
 LATE_STEP_WEIGHT_END = 2.0
@@ -124,18 +125,23 @@ class ResNet18Encoder(nn.Module):
 
 
 class FutureBC(nn.Module):
-    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True):
+    def __init__(self, arm_dim, chunk_horizon, obs_horizon, future_horizon, num_tasks, hidden_dim=384, num_layers=4, num_heads=8, dropout=0.10, ff_mult=4, pretrained_backbone=True, future_bins=4):
         super().__init__()
         self.arm_dim = int(arm_dim)
         self.chunk_horizon = int(chunk_horizon)
         self.obs_horizon = int(obs_horizon)
         self.future_horizon = int(future_horizon)
+        self.future_bins = int(future_bins)
         self.num_tasks = int(num_tasks)
 
         self.image_encoder = ResNet18Encoder(pretrained=pretrained_backbone)
         self.image_proj = nn.Linear(self.image_encoder.out_dim, hidden_dim)
         self.task_emb = nn.Embedding(num_tasks, hidden_dim)
         self.goal_emb = nn.Embedding(4, hidden_dim)
+        self.future_pool_proj = nn.Sequential(
+            nn.Linear(hidden_dim * self.future_bins, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
         self.action_queries = nn.Parameter(torch.zeros(1, self.chunk_horizon, hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
 
@@ -183,13 +189,39 @@ class FutureBC(nn.Module):
         x = self.transformer(self.input_norm(x))
         return self.output_norm(x[:, :self.chunk_horizon])
 
+    def encode_tokens_with_future_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
+        bsz = obs_static.shape[0]
+        tok_actions = self.action_queries.expand(bsz, -1, -1)
+        tok_task = self.task_emb(task_id).unsqueeze(1)
+        tok_goal = self.goal_emb(goal_type).unsqueeze(1)
+        tok_obs_static = self.encode_frames(obs_static)
+        tok_obs_gripper = self.encode_frames(obs_gripper)
+        tok_future = self.encode_frames(future_static)
+        x = torch.cat([tok_actions, tok_task, tok_goal, tok_obs_static, tok_obs_gripper, tok_future], dim=1)
+        token_types = ([0] * self.chunk_horizon + [1] + [2] + [3] * self.obs_horizon + [4] * self.obs_horizon + [5] * self.future_horizon)
+        token_types = torch.tensor(token_types, dtype=torch.long, device=x.device).unsqueeze(0).expand(bsz, -1)
+        x = x + self.modality_emb(token_types) + self.pos_emb[:, :x.shape[1], :]
+        x = self.transformer(self.input_norm(x))
+        x = self.output_norm(x)
+        action_latent = x[:, :self.chunk_horizon]
+        future_start = self.chunk_horizon + 2 + self.obs_horizon + self.obs_horizon
+        future_tokens = x[:, future_start:future_start + self.future_horizon]
+        future_bins = F.adaptive_avg_pool1d(
+            future_tokens.transpose(1, 2),
+            self.future_bins,
+        ).transpose(1, 2)
+        future_latent = self.future_pool_proj(
+            future_bins.reshape(bsz, -1)
+        )
+        return action_latent, future_latent
+
     def forward(self, obs_static, obs_gripper, future_static, task_id, goal_type):
         z = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
         return self.arm_head(z), self.gripper_head(z).squeeze(-1)
 
     def forward_with_latent(self, obs_static, obs_gripper, future_static, task_id, goal_type):
-        z = self.encode_tokens(obs_static, obs_gripper, future_static, task_id, goal_type)
-        return z, self.arm_head(z), self.gripper_head(z).squeeze(-1)
+        z, g_t = self.encode_tokens_with_future_latent(obs_static, obs_gripper, future_static, task_id, goal_type)
+        return z, g_t, self.arm_head(z), self.gripper_head(z).squeeze(-1)
 
 
 def arm_loss_fn(pred, target):
@@ -272,6 +304,7 @@ def main():
         dropout=DROPOUT,
         ff_mult=FF_MULT,
         pretrained_backbone=USE_PRETRAINED_BACKBONE,
+        future_bins=FUTURE_BINS,
     ).to(DEVICE)
 
     backbone_params = list(model.image_encoder.parameters())
@@ -297,6 +330,7 @@ def main():
         "num_heads": NUM_HEADS,
         "dropout": DROPOUT,
         "ff_mult": FF_MULT,
+        "future_bins": FUTURE_BINS,
         "chunk_horizon": chunk_horizon,
         "arm_dim": arm_dim,
         "obs_horizon": obs_horizon,
