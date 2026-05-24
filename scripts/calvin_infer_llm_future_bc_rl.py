@@ -8,6 +8,8 @@ if not hasattr(np, "bool"):
 if not hasattr(np, "object"):
     np.object = object
 
+import argparse
+import csv
 import json
 import os
 
@@ -82,8 +84,10 @@ OUTPUT_DIR = env_path("CALVIN_INFERENCE_OUTPUT_DIR", OUT_BASE / "llm_future_poli
 FUTURE_SHIFTS = (-2, 0, 2)
 RAFC_INIT_ALPHA = 0.90
 RAFC_CENTER_LOGIT_BIAS = 3.0
+EVAL_MODE = os.environ.get("CALVIN_EVAL_MODE", "single").strip().lower()
+USE_RAFC_EVAL = os.environ.get("CALVIN_USE_RAFC", "0") != "0"
 FUTURE_SOURCE = os.environ.get("CALVIN_FUTURE_SOURCE", "generated").strip().lower()
-FUTURE_EVAL_MODE = os.environ.get("CALVIN_FUTURE_MODE", "generated").lower()
+FUTURE_EVAL_MODE = os.environ.get("CALVIN_FUTURE_MODE", "gen").lower()
 FUTURE_EVAL_SHIFT = int(os.environ.get("CALVIN_FUTURE_SHIFT", "0"))
 WRONG_FUTURE_VIDEO_PATH = os.environ.get("CALVIN_WRONG_FUTURE_VIDEO_PATH", "")
 
@@ -92,7 +96,7 @@ SHOW_GUI = True
 SAVE_VIDEO = True
 VIDEO_FPS = 12
 IMAGE_SIZE = None
-NUM_EPISODES = 3
+NUM_EPISODES = int(os.environ.get("CALVIN_NUM_EVAL_EPISODES", "3"))
 MAX_EPISODE_STEPS = 150
 ARM_ACTION_DIM = 6
 ACTION_DIM = ARM_ACTION_DIM + 1
@@ -112,6 +116,70 @@ def set_seed(seed):
 
 def ensure_dir(path):
     path.mkdir(parents=True, exist_ok=True)
+
+
+def output_path(path_value):
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
+
+def normalize_future_mode(value):
+    mode = str(value).strip().lower()
+    aliases = {
+        "null": "nofuture",
+        "none": "nofuture",
+        "generated": "gen",
+        "demo": "gt",
+        "groundtruth": "gt",
+        "ground_truth": "gt",
+        "temporal_shift": "shift",
+        "temporalshift": "shift",
+    }
+    return aliases.get(mode, mode)
+
+
+def default_run_name(seed, future_mode, use_rafc, future_shift=0):
+    mode = str(future_mode)
+    if mode == "shift":
+        shift_tag = "p{}".format(int(future_shift)) if int(future_shift) >= 0 else "m{}".format(abs(int(future_shift)))
+        mode = "shift_{}".format(shift_tag)
+    policy_tag = "rafc" if use_rafc else "single"
+    return "multitask_{}_{}_td3bc_seed{}".format(mode, policy_tag, int(seed))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="CALVIN paper evaluation")
+    parser.add_argument("--eval_mode", choices=["single", "table2", "fig4_table3", "table4"], default=os.environ.get("CALVIN_EVAL_MODE", "single").strip().lower())
+    parser.add_argument("--future_mode", choices=["nofuture", "gt", "gen", "shift"], default=normalize_future_mode(os.environ.get("CALVIN_FUTURE_MODE", "gen")))
+    parser.add_argument("--use_rafc", type=int, choices=[0, 1], default=int(os.environ.get("CALVIN_USE_RAFC", "0")))
+    parser.add_argument("--future_shift", type=int, choices=[-6, -4, -2, 0, 2, 4, 6], default=int(os.environ.get("CALVIN_FUTURE_SHIFT", "0")))
+    parser.add_argument("--seed", type=int, default=int(os.environ.get("CALVIN_SEED", "42")))
+    parser.add_argument("--max_episode_steps", type=int, default=int(os.environ.get("CALVIN_MAX_EPISODE_STEPS", "150")))
+    parser.add_argument("--task", default=os.environ.get("CALVIN_EVAL_TASK", ""))
+    parser.add_argument("--command", default=os.environ.get("CALVIN_EVAL_COMMAND", ""))
+    parser.add_argument("--checkpoint_step", type=int, default=int(os.environ.get("CALVIN_CHECKPOINT_STEP", "-1")))
+    parser.add_argument("--checkpoint_path", default=os.environ.get("CALVIN_FINE_TUNING_ACTOR_PATH", ""))
+    parser.add_argument("--num_episodes", type=int, default=int(os.environ.get("CALVIN_NUM_EVAL_EPISODES", str(NUM_EPISODES))))
+    parser.add_argument("--out_csv", default=os.environ.get("CALVIN_EVAL_OUT_CSV", "results/single_eval.csv"))
+    parser.add_argument("--save_video", type=int, choices=[0, 1], default=int(os.environ.get("CALVIN_SAVE_VIDEO", "0")))
+    return parser.parse_args()
+
+
+def configure_from_args(args):
+    global EVAL_MODE, USE_RAFC_EVAL, FUTURE_EVAL_MODE, FUTURE_EVAL_SHIFT
+    global FUTURE_SOURCE, SEED, MAX_EPISODE_STEPS, NUM_EPISODES, SAVE_VIDEO
+
+    EVAL_MODE = str(args.eval_mode).strip().lower()
+    USE_RAFC_EVAL = bool(int(args.use_rafc))
+    FUTURE_EVAL_MODE = normalize_future_mode(args.future_mode)
+    FUTURE_EVAL_SHIFT = int(args.future_shift)
+    FUTURE_SOURCE = future_source_for_mode(FUTURE_EVAL_MODE)
+    SEED = int(args.seed)
+    MAX_EPISODE_STEPS = int(args.max_episode_steps)
+    NUM_EPISODES = int(args.num_episodes)
+    SAVE_VIDEO = bool(int(args.save_video))
 
 
 def patch_yaml_tags_for_omegaconf():
@@ -325,11 +393,21 @@ def make_rafc_future_batch(future_static, future_shifts=FUTURE_SHIFTS):
     return np.stack(futures, axis=0).astype(np.uint8)
 
 
-def apply_future_eval_mode(future_static):
-    if FUTURE_EVAL_MODE in ("null", "nofuture"):
+def future_source_for_mode(future_mode):
+    if future_mode == "gt":
+        return "demo"
+    if future_mode == "nofuture":
+        return "null"
+    return "generated"
+
+
+def apply_future_eval_mode(future_static, future_mode=None, future_shift=None):
+    mode = normalize_future_mode(FUTURE_EVAL_MODE if future_mode is None else future_mode)
+    shift = FUTURE_EVAL_SHIFT if future_shift is None else int(future_shift)
+    if mode == "nofuture":
         return make_null_future(future_static)
-    if FUTURE_EVAL_MODE in ("shift", "temporal_shift", "temporalshift"):
-        return shift_future(future_static, FUTURE_EVAL_SHIFT)
+    if mode == "shift" or shift != 0:
+        return shift_future(future_static, shift)
     return np.asarray(future_static, dtype=np.uint8)
 
 
@@ -774,13 +852,17 @@ class FineTuningActorWrapper(object):
 
 
 class LLMFuturePolicyRunner(object):
-    def __init__(self, segments, base_policy, fine_tuning_actor, cache, plan):
+    def __init__(self, segments, base_policy, fine_tuning_actor, cache, plan, future_mode=None, future_shift=None, show_gui=None):
         self.segments = list(segments)
         self.base_policy = base_policy
         self.fine_tuning_actor = fine_tuning_actor
         self.cache = cache
         self.plan = plan
         self.task = plan["task_key"]
+        self.future_mode = normalize_future_mode(FUTURE_EVAL_MODE if future_mode is None else future_mode)
+        self.future_shift = FUTURE_EVAL_SHIFT if future_shift is None else int(future_shift)
+        self.future_source = future_source_for_mode(self.future_mode)
+        self.show_gui = SHOW_GUI if show_gui is None else bool(show_gui)
         self.env = None
         self.tasks_oracle = None
         self.current_segment = None
@@ -788,17 +870,21 @@ class LLMFuturePolicyRunner(object):
         self.obs_static_hist = deque(maxlen=base_policy.obs_horizon)
         self.obs_gripper_hist = deque(maxlen=base_policy.obs_horizon)
         self.last_obs = None
-        future_path = WRONG_FUTURE_VIDEO_PATH if FUTURE_EVAL_MODE == "wrong" and WRONG_FUTURE_VIDEO_PATH else plan["generated_video_path"]
+        future_path = WRONG_FUTURE_VIDEO_PATH if self.future_mode == "wrong" and WRONG_FUTURE_VIDEO_PATH else plan["generated_video_path"]
         self.future_path = resolve_future_video_path(self.task, future_path)
         self.generated_future_static = None
-        if FUTURE_SOURCE == "generated" and self.future_path.exists():
-            self.generated_future_static = apply_future_eval_mode(read_future_video(self.future_path, base_policy.future_horizon, IMAGE_SIZE))
+        if self.future_source == "generated" and self.future_path.exists():
+            self.generated_future_static = apply_future_eval_mode(
+                read_future_video(self.future_path, base_policy.future_horizon, IMAGE_SIZE),
+                self.future_mode,
+                self.future_shift,
+            )
         self.warned_missing_generated = False
         self.future_static = None
 
     def _ensure_env(self):
         if self.env is None:
-            self.env, self.tasks_oracle = make_env(SHOW_GUI)
+            self.env, self.tasks_oracle = make_env(self.show_gui)
 
     def _segment_for_task(self, episode_id):
         candidates = [s for s in self.segments if s["task"] == self.task]
@@ -818,18 +904,18 @@ class LLMFuturePolicyRunner(object):
         )
 
     def _select_future(self, start_idx, init_static):
-        if FUTURE_SOURCE == "generated":
+        if self.future_source == "generated":
             if self.generated_future_static is not None:
                 return self.generated_future_static
             if not self.warned_missing_generated:
                 print("[WARN] Generated future missing; falling back to demo future.")
                 self.warned_missing_generated = True
-            return apply_future_eval_mode(self._demo_future(start_idx))
-        if FUTURE_SOURCE == "demo":
-            return apply_future_eval_mode(self._demo_future(start_idx))
-        if FUTURE_SOURCE == "null":
+            return apply_future_eval_mode(self._demo_future(start_idx), self.future_mode, self.future_shift)
+        if self.future_source == "demo":
+            return apply_future_eval_mode(self._demo_future(start_idx), self.future_mode, self.future_shift)
+        if self.future_source == "null":
             return make_null_future_clip(init_static, self.base_policy.future_horizon)
-        raise ValueError("Unknown FUTURE_SOURCE: {}".format(FUTURE_SOURCE))
+        raise ValueError("Unknown future_source: {}".format(self.future_source))
 
     def reset(self, episode_id):
         self._ensure_env()
@@ -867,16 +953,20 @@ class LLMFuturePolicyRunner(object):
     def step(self, action):
         step_res = self.env.step(np.asarray(action, dtype=np.float32))
         if len(step_res) == 5:
-            obs, _, terminated_raw, truncated_raw, _ = step_res
+            obs, raw_reward, terminated_raw, truncated_raw, _ = step_res
             env_done = bool(terminated_raw) or bool(truncated_raw)
         else:
-            obs, _, env_done, _ = step_res
+            obs, raw_reward, env_done, _ = step_res
         self.last_obs = obs
         self.obs_static_hist.append(resize_if_needed(get_u8(obs, "rgb_static"), IMAGE_SIZE))
         self.obs_gripper_hist.append(resize_if_needed(get_u8(obs, "rgb_gripper"), IMAGE_SIZE))
         curr_info = self.env.get_info()
         success = oracle_success(self.tasks_oracle, self.start_info, curr_info, self.task)
-        return self._policy_input(), bool(success), bool(env_done), {"success": bool(success), "task": self.task, "segment_id": int(self.current_segment["segment_id"])}
+        try:
+            reward_value = float(raw_reward)
+        except Exception:
+            reward_value = 0.0
+        return self._policy_input(), bool(success), bool(env_done), reward_value, {"success": bool(success), "task": self.task, "segment_id": int(self.current_segment["segment_id"])}
 
     def frame(self):
         if self.last_obs is None:
@@ -915,50 +1005,124 @@ def extract_rafc_inputs(base_policy, pi, future_shifts=FUTURE_SHIFTS):
     }
 
 
-def main():
-    set_seed(SEED)
-    ensure_dir(OUTPUT_DIR)
-    if CALVIN_ROOT is None:
-        raise RuntimeError("Set CALVIN_ROOT before running CALVIN inference")
-    if DATA_ROOT is None:
-        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before running CALVIN inference")
-    os.chdir(CALVIN_ROOT)
-    os.environ["CALVIN_ROOT"] = str(CALVIN_ROOT)
+SINGLE_COLUMNS = [
+    "task",
+    "future_mode",
+    "use_rafc",
+    "future_shift",
+    "seed",
+    "checkpoint_step",
+    "max_episode_steps",
+    "success_rate",
+    "mean_return",
+    "alpha",
+    "w_minus2",
+    "w_0",
+    "w_plus2",
+]
 
-    segments, tasks, _ = load_segments(SEGMENTS_JSON)
-    ontology = load_ontology(ONTOLOGY_PATH)
-    _, eval_segments = split_segments(segments, TRAIN_SPLIT, SEED)
-    cache = EpisodeCache(DATA_ROOT)
-    base_policy = FrozenBCPolicy(BC_CKPT_PATH, DEVICE)
-    fine_tuning_actor = FineTuningActorWrapper(FINE_TUNING_ACTOR_PATH, DEVICE)
+TABLE_COLUMNS = ["condition"] + SINGLE_COLUMNS
+TABLE4_COLUMNS = ["condition", "future_mode", "future_shift", "seed", "task", "alpha", "w_minus2", "w_0", "w_plus2"]
 
-    command = input("command> ").strip()
 
-    env0, _ = make_env(False)
-    first_seg = eval_segments[0]
-    item = cache.get(int(first_seg["global_start_idx"]))
-    obs0 = env0.reset(robot_obs=np.asarray(item["robot_obs"], dtype=np.float32), scene_obs=np.asarray(item["scene_obs"], dtype=np.float32))
-    state_for_llm = short_state(obs0, env0.get_info())
-    try:
-        env0.close()
-    except Exception:
-        pass
+def write_csv_rows(path, fieldnames, rows):
+    path = output_path(path)
+    ensure_dir(path.parent)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    return path
 
-    plan = query_llm_for_task(command, tasks, state_for_llm, ontology)
-    plan_path = OUTPUT_DIR / "llm_plan.json"
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump({"command": command, "ontology_path": str(ONTOLOGY_PATH), "plan": plan}, f, indent=2)
 
-    print("task:", plan["task_key"])
+def plan_for_task(task, ontology):
+    task_meta = ontology_tasks(ontology).get(task, {})
+    future_path = resolve_future_video_path(
+        task,
+        task_meta.get("future_video_path", task_meta.get("generated_video_path", "")),
+    )
+    return {
+        "task_key": task,
+        "selected_object": task_meta.get("object", task_meta.get("target_object", "")),
+        "interaction_part": task_meta.get("interaction_part", task_meta.get("part", "")),
+        "motion_type": task_meta.get("motion_type", task_meta.get("motion", "")),
+        "future_caption": task_meta.get("future_caption", "a robot arm completing the task {}".format(task)),
+        "generated_video_path": str(future_path),
+        "success_criteria": task_meta.get("success_criteria", "CALVIN oracle reports task success"),
+        "reasoning": "selected from the evaluation task list",
+    }
 
-    runner = LLMFuturePolicyRunner(eval_segments, base_policy, fine_tuning_actor, cache, plan)
-    print("policy:", "RAFC" if fine_tuning_actor.uses_rafc else "single-future")
-    print("future_source:", FUTURE_SOURCE)
-    print("future:", runner.future_path)
-    print("future_mode:", FUTURE_EVAL_MODE)
+
+def checkpoint_filename(checkpoint_step):
+    if int(checkpoint_step) > 0:
+        return "policy_step_{:06d}.pt".format(int(checkpoint_step))
+    return "policy_best.pt"
+
+
+def resolve_actor_path(seed, future_mode, use_rafc, future_shift, checkpoint_step, checkpoint_path=""):
+    if int(checkpoint_step) == 0:
+        return None
+    if checkpoint_path:
+        path = output_path(checkpoint_path)
+        if path.exists():
+            return path
+        raise FileNotFoundError("Checkpoint path does not exist: {}".format(path))
+
+    candidates = []
+    modes = [normalize_future_mode(future_mode)]
+    if modes[0] == "shift":
+        modes.append("gen")
+    for mode in modes:
+        run_shift = future_shift if mode == "shift" else 0
+        run_dir = RESULTS_ROOT / "rafc_rl_runs" / default_run_name(seed, mode, use_rafc, run_shift)
+        if int(checkpoint_step) > 0:
+            candidates.append(run_dir / checkpoint_filename(checkpoint_step))
+            if int(checkpoint_step) == 140000:
+                candidates.append(run_dir / "policy_final.pt")
+        else:
+            candidates.append(run_dir / "policy_best.pt")
+            candidates.append(run_dir / "policy_final.pt")
+
+    old_run_dir = RESULTS_ROOT / "rafc_rl_runs" / "multitask_step6_rafc_td3bc_seed{}".format(int(seed))
+    if int(checkpoint_step) > 0:
+        candidates.append(old_run_dir / checkpoint_filename(checkpoint_step))
+    else:
+        candidates.append(old_run_dir / "policy_best.pt")
+        candidates.append(Path(FINE_TUNING_ACTOR_PATH))
+
+    for path in candidates:
+        if Path(path).exists():
+            return Path(path)
+    raise FileNotFoundError("Could not find RL checkpoint. Tried: {}".format(", ".join(str(p) for p in candidates)))
+
+
+def load_actor_for_config(actor_cache, seed, future_mode, use_rafc, future_shift, checkpoint_step, checkpoint_path=""):
+    actor_path = resolve_actor_path(seed, future_mode, use_rafc, future_shift, checkpoint_step, checkpoint_path)
+    if actor_path is None:
+        return None, "bc"
+    key = str(actor_path)
+    if key not in actor_cache:
+        actor_cache[key] = FineTuningActorWrapper(actor_path, DEVICE)
+    return actor_cache[key], str(actor_path)
+
+
+def run_task_episodes(eval_segments, base_policy, fine_tuning_actor, cache, plan, future_mode, future_shift, use_rafc, num_episodes, max_episode_steps, save_video=False):
+    runner = LLMFuturePolicyRunner(
+        eval_segments,
+        base_policy,
+        fine_tuning_actor,
+        cache,
+        plan,
+        future_mode=future_mode,
+        future_shift=future_shift,
+        show_gui=False,
+    )
     results = []
+    gate_alphas = []
+    gate_weights = []
     try:
-        for ep in range(NUM_EPISODES):
+        for ep in range(int(num_episodes)):
             pi, info = runner.reset(ep)
             frames = []
             fr = runner.frame()
@@ -967,33 +1131,41 @@ def main():
             success = False
             env_done = False
             steps = 0
+            episode_return = 0.0
             last_info = info
-            gate_alphas = []
-            gate_weights = []
-            while not success and not env_done and steps < MAX_EPISODE_STEPS:
-                if fine_tuning_actor.uses_rafc:
+            while not success and not env_done and steps < int(max_episode_steps):
+                if fine_tuning_actor is None:
+                    base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
+                    base_action = to_base_action(base)
+                    delta = np.zeros((ACTION_DIM,), dtype=np.float32)
+                elif use_rafc:
+                    if fine_tuning_actor.gate is None:
+                        raise RuntimeError("Requested RAFC evaluation, but the checkpoint does not contain a gate")
                     rafc = extract_rafc_inputs(base_policy, pi, fine_tuning_actor.future_shifts)
                     delta, gate_info = fine_tuning_actor.act_rafc(rafc)
                     base_action = gate_info["base_action"]
                     gate_alphas.append(float(gate_info["alpha"].mean()))
-                    gate_weights.append(gate_info["weights"])
+                    gate_weights.append(np.asarray(gate_info["weights"], dtype=np.float32))
                 else:
                     base = base_policy.extract(pi["obs_static"], pi["obs_gripper"], pi["future_static"], pi["task"], pi["goal_type"])
                     base_action = to_base_action(base)
                     delta = fine_tuning_actor.act(base["feature"], base["g_t"], base_action)
                 action = runner.compose_action(base_action, delta)
-                pi, success, env_done, last_info = runner.step(action)
+                pi, success, env_done, reward, last_info = runner.step(action)
+                episode_return += float(reward)
                 steps += 1
                 fr = runner.frame()
                 if fr is not None:
                     frames.append(fr)
-            row = {"episode": ep + 1, "task": plan["task_key"], "success": bool(success), "steps": int(steps), "segment_id": int(last_info.get("segment_id", -1))}
-            if gate_alphas:
-                row["gate_alpha"] = float(np.mean(gate_alphas))
-                row["gate_weights"] = [float(x) for x in np.mean(np.stack(gate_weights, axis=0), axis=0)]
-            results.append(row)
-            print("ep {:02d} task={} success={} steps={}".format(ep + 1, plan["task_key"], success, steps))
-            if SAVE_VIDEO and len(frames) > 0:
+            results.append({
+                "episode": ep + 1,
+                "task": plan["task_key"],
+                "success": bool(success),
+                "steps": int(steps),
+                "return": float(episode_return),
+                "segment_id": int(last_info.get("segment_id", -1)),
+            })
+            if save_video and len(frames) > 0:
                 write_video(frames, OUTPUT_DIR / "episode_{:02d}_{}.mp4".format(ep + 1, plan["task_key"]), VIDEO_FPS)
     finally:
         runner.close()
@@ -1002,22 +1174,246 @@ def main():
         except Exception:
             pass
 
-    summary = {
-        "command": command,
-        "ontology_path": str(ONTOLOGY_PATH),
-        "plan": plan,
-        "uses_rafc": bool(fine_tuning_actor.uses_rafc),
-        "future_source": FUTURE_SOURCE,
-        "future_shifts": list(FUTURE_SHIFTS),
-        "future_mode": FUTURE_EVAL_MODE,
-        "future_shift": FUTURE_EVAL_SHIFT,
-        "num_episodes": NUM_EPISODES,
+    weights = np.mean(np.stack(gate_weights, axis=0), axis=0) if gate_weights else np.full((len(FUTURE_SHIFTS),), np.nan, dtype=np.float32)
+    return {
         "success_rate": float(sum(int(r["success"]) for r in results) / max(len(results), 1)),
-        "results": results,
+        "mean_return": float(np.mean([r["return"] for r in results])) if results else 0.0,
+        "alpha": float(np.mean(gate_alphas)) if gate_alphas else "",
+        "weights": [float(x) for x in weights] if gate_weights else ["", "", ""],
+        "episodes": results,
     }
-    with open(OUTPUT_DIR / "run_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    print("saved:", OUTPUT_DIR / "run_summary.json")
+
+
+def evaluate_config(context, actor_cache, task, future_mode, use_rafc, future_shift, seed, checkpoint_step, max_episode_steps, num_episodes, checkpoint_path="", save_video=False):
+    set_seed(seed)
+    segments = context["segments"]
+    _, eval_segments = split_segments(segments, TRAIN_SPLIT, seed)
+    plan = plan_for_task(task, context["ontology"])
+    fine_tuning_actor, resolved_actor = load_actor_for_config(
+        actor_cache,
+        seed,
+        future_mode,
+        bool(use_rafc),
+        future_shift,
+        checkpoint_step,
+        checkpoint_path,
+    )
+    metrics = run_task_episodes(
+        eval_segments,
+        context["base_policy"],
+        fine_tuning_actor,
+        context["cache"],
+        plan,
+        future_mode,
+        future_shift,
+        bool(use_rafc) and fine_tuning_actor is not None,
+        num_episodes,
+        max_episode_steps,
+        save_video=save_video,
+    )
+    weights = metrics["weights"]
+    return {
+        "task": task,
+        "future_mode": normalize_future_mode(future_mode),
+        "use_rafc": int(bool(use_rafc) and fine_tuning_actor is not None),
+        "future_shift": int(future_shift),
+        "seed": int(seed),
+        "checkpoint_step": int(checkpoint_step),
+        "max_episode_steps": int(max_episode_steps),
+        "success_rate": metrics["success_rate"],
+        "mean_return": metrics["mean_return"],
+        "alpha": metrics["alpha"],
+        "w_minus2": weights[0] if len(weights) > 0 else "",
+        "w_0": weights[1] if len(weights) > 1 else "",
+        "w_plus2": weights[2] if len(weights) > 2 else "",
+        "checkpoint_path": resolved_actor,
+    }
+
+
+def write_learning_curve_png(rows, path):
+    path = output_path(path)
+    ensure_dir(path.parent)
+    width, height = 1100, 700
+    img = np.full((height, width, 3), 255, dtype=np.uint8)
+    left, right, top, bottom = 90, width - 50, 70, height - 85
+    cv2.line(img, (left, bottom), (right, bottom), (0, 0, 0), 2)
+    cv2.line(img, (left, bottom), (left, top), (0, 0, 0), 2)
+    cv2.putText(img, "CALVIN BC+RL learning curve", (left, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
+    checkpoints = sorted({int(r["checkpoint_step"]) for r in rows})
+    max_step = max(max(checkpoints), 1)
+    colors = {"nofuture": (180, 80, 50), "gt": (50, 140, 60), "gen": (40, 90, 210)}
+    for yv in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        y = int(bottom - yv * (bottom - top))
+        cv2.line(img, (left, y), (right, y), (230, 230, 230), 1)
+        cv2.putText(img, "{:.0f}%".format(yv * 100.0), (20, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
+    for i, step in enumerate(checkpoints):
+        x = int(left + (step / float(max_step)) * (right - left))
+        cv2.line(img, (x, bottom), (x, bottom + 6), (0, 0, 0), 1)
+        cv2.putText(img, str(step), (x - 28, bottom + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 60, 60), 1, cv2.LINE_AA)
+    for future_mode in ["nofuture", "gt", "gen"]:
+        points = []
+        for step in checkpoints:
+            vals = [float(r["success_rate"]) for r in rows if r["future_mode"] == future_mode and int(r["checkpoint_step"]) == step]
+            if vals:
+                x = int(left + (step / float(max_step)) * (right - left))
+                y = int(bottom - np.clip(np.mean(vals), 0.0, 1.0) * (bottom - top))
+                points.append((x, y))
+        if len(points) > 1:
+            cv2.polylines(img, [np.asarray(points, dtype=np.int32)], False, colors[future_mode], 3, cv2.LINE_AA)
+        for point in points:
+            cv2.circle(img, point, 5, colors[future_mode], -1, cv2.LINE_AA)
+    legend_x = right - 230
+    for j, future_mode in enumerate(["nofuture", "gt", "gen"]):
+        y = top + 28 * j
+        cv2.line(img, (legend_x, y), (legend_x + 35, y), colors[future_mode], 4, cv2.LINE_AA)
+        cv2.putText(img, future_mode, (legend_x + 45, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 40, 40), 1, cv2.LINE_AA)
+    cv2.imwrite(str(path), img)
+    return path
+
+
+def prepare_context():
+    ensure_dir(OUTPUT_DIR)
+    if CALVIN_ROOT is None:
+        raise RuntimeError("Set CALVIN_ROOT before running CALVIN inference")
+    if DATA_ROOT is None:
+        raise RuntimeError("Set CALVIN_DATA_ROOT or CALVIN_ROOT before running CALVIN inference")
+    if not BC_CKPT_PATH.exists():
+        raise FileNotFoundError("Missing BC checkpoint: {}".format(BC_CKPT_PATH))
+    os.chdir(CALVIN_ROOT)
+    os.environ["CALVIN_ROOT"] = str(CALVIN_ROOT)
+    segments, tasks, _ = load_segments(SEGMENTS_JSON)
+    return {
+        "segments": segments,
+        "tasks": list(tasks),
+        "ontology": load_ontology(ONTOLOGY_PATH),
+        "cache": EpisodeCache(DATA_ROOT),
+        "base_policy": FrozenBCPolicy(BC_CKPT_PATH, DEVICE),
+    }
+
+
+def run_single(args, context, actor_cache):
+    if args.command:
+        plan = fallback_plan(args.command, context["tasks"], context["ontology"])
+        task = plan["task_key"]
+    else:
+        task = args.task.strip() if args.task.strip() else context["tasks"][0]
+    row = evaluate_config(
+        context,
+        actor_cache,
+        task,
+        args.future_mode,
+        bool(args.use_rafc),
+        args.future_shift,
+        args.seed,
+        args.checkpoint_step,
+        args.max_episode_steps,
+        args.num_episodes,
+        checkpoint_path=args.checkpoint_path,
+        save_video=bool(args.save_video),
+    )
+    out_path = write_csv_rows(args.out_csv, SINGLE_COLUMNS, [row])
+    print("saved:", out_path)
+    print("success_rate={:.3f} mean_return={:.3f}".format(float(row["success_rate"]), float(row["mean_return"])))
+
+
+def run_table2(args, context, actor_cache):
+    rows = []
+    settings = [
+        ("GTFuture", "gt", False),
+        ("GenFuture", "gen", False),
+        ("GenFuture+RAFC", "gen", True),
+    ]
+    for condition, future_mode, use_rafc in settings:
+        for future_shift in [-6, -4, -2, 0, 2, 4, 6]:
+            for task in context["tasks"]:
+                for seed in [42, 43, 44]:
+                    row = evaluate_config(
+                        context,
+                        actor_cache,
+                        task,
+                        future_mode,
+                        use_rafc,
+                        future_shift,
+                        seed,
+                        args.checkpoint_step,
+                        args.max_episode_steps,
+                        args.num_episodes,
+                    )
+                    row["condition"] = condition
+                    rows.append(row)
+                    print("table2 {} shift={} task={} seed={} success={:.3f}".format(condition, future_shift, task, seed, row["success_rate"]))
+    out_path = write_csv_rows("results/table2_temporal_shift.csv", TABLE_COLUMNS, rows)
+    print("saved:", out_path)
+
+
+def run_fig4_table3(args, context, actor_cache):
+    rows = []
+    for future_mode in ["nofuture", "gt", "gen"]:
+        for checkpoint_step in [0, 30000, 60000, 90000, 120000, 140000]:
+            for task in context["tasks"]:
+                for seed in [42, 43, 44]:
+                    row = evaluate_config(
+                        context,
+                        actor_cache,
+                        task,
+                        future_mode,
+                        False,
+                        0,
+                        seed,
+                        checkpoint_step,
+                        args.max_episode_steps,
+                        args.num_episodes,
+                    )
+                    row["condition"] = "Fig4/Table3"
+                    rows.append(row)
+                    print("fig4 future={} ckpt={} task={} seed={} success={:.3f}".format(future_mode, checkpoint_step, task, seed, row["success_rate"]))
+    out_path = write_csv_rows("results/fig4_table3_learning_curve.csv", TABLE_COLUMNS, rows)
+    img_path = write_learning_curve_png(rows, "img/ex_rl_full.png")
+    print("saved:", out_path)
+    print("saved:", img_path)
+
+
+def run_table4(args, context, actor_cache):
+    rows = []
+    for future_shift in [0, -4, 4]:
+        condition = "gen_shift_{:+d}".format(future_shift)
+        for task in context["tasks"]:
+            for seed in [42, 43, 44]:
+                row = evaluate_config(
+                    context,
+                    actor_cache,
+                    task,
+                    "gen",
+                    True,
+                    future_shift,
+                    seed,
+                    args.checkpoint_step,
+                    args.max_episode_steps,
+                    args.num_episodes,
+                )
+                row["condition"] = condition
+                rows.append(row)
+                print("table4 {} task={} seed={} alpha={}".format(condition, task, seed, row["alpha"]))
+    out_path = write_csv_rows("results/table4_gate_diagnostics.csv", TABLE4_COLUMNS, rows)
+    print("saved:", out_path)
+
+
+def main():
+    args = parse_args()
+    configure_from_args(args)
+    set_seed(SEED)
+    context = prepare_context()
+    actor_cache = {}
+    if EVAL_MODE == "single":
+        run_single(args, context, actor_cache)
+    elif EVAL_MODE == "table2":
+        run_table2(args, context, actor_cache)
+    elif EVAL_MODE == "fig4_table3":
+        run_fig4_table3(args, context, actor_cache)
+    elif EVAL_MODE == "table4":
+        run_table4(args, context, actor_cache)
+    else:
+        raise ValueError("Unknown eval_mode: {}".format(EVAL_MODE))
 
 
 if __name__ == "__main__":

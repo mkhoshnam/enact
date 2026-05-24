@@ -8,6 +8,8 @@ if not hasattr(np, "bool"):
 if not hasattr(np, "object"):
     np.object = object
 
+import argparse
+import csv
 import json
 import os
 
@@ -60,7 +62,7 @@ BC_CKPT_PATH = env_path("CALVIN_BC_CKPT_PATH", OUT_BASE / "calvin_bc" / "bc_acto
 RESULTS_ROOT = env_path("CALVIN_RESULTS_ROOT", OUT_BASE)
 RUN_NAME = os.environ.get(
     "CALVIN_RL_RUN_NAME",
-    "multitask_step6_rafc_td3bc_seed{}".format(SEED),
+    "multitask_gen_single_td3bc_seed{}".format(SEED),
 )
 RESULTS_DIR = env_path("CALVIN_RL_RESULTS_DIR", RESULTS_ROOT / "rafc_rl_runs" / RUN_NAME)
 FINAL_ACTOR_PATH = env_path("CALVIN_RL_FINAL_ACTOR_PATH", RESULTS_DIR / "policy_final.pt")
@@ -68,8 +70,12 @@ BEST_ACTOR_PATH = env_path("CALVIN_RL_BEST_ACTOR_PATH", RESULTS_DIR / "policy_be
 HISTORY_JSON = RESULTS_DIR / "history.json"
 
 GENERATED_FUTURE_ROOT = env_path("CALVIN_GENERATED_FUTURE_ROOT", OUT_BASE / "generated_inpainted_calvin_futures")
-USE_GENERATED_FUTURES_DURING_RL = os.environ.get("CALVIN_USE_GENERATED_FUTURES_DURING_RL", "0") == "1"
-USE_RAFC = os.environ.get("CALVIN_USE_RAFC", "1") != "0"
+FUTURE_MODE = os.environ.get("CALVIN_FUTURE_MODE", "gen").strip().lower()
+FUTURE_SHIFT = int(os.environ.get("CALVIN_FUTURE_SHIFT", "0"))
+USE_GENERATED_FUTURES_DURING_RL = os.environ.get("CALVIN_USE_GENERATED_FUTURES_DURING_RL", "1") == "1"
+USE_RAFC = os.environ.get("CALVIN_USE_RAFC", "0") != "0"
+SAVE_GATE_STATS = os.environ.get("CALVIN_SAVE_GATE_STATS", "0") == "1"
+OUT_CSV = env_path("CALVIN_RL_OUT_CSV", REPO_ROOT / "results" / "rl_train_eval.csv")
 FUTURE_SHIFTS = (-2, 0, 2)
 RAFC_INIT_ALPHA = 0.90
 RAFC_CENTER_LOGIT_BIAS = 3.0
@@ -138,6 +144,74 @@ def set_seed(seed):
 
 def ensure_dir(path):
     path.mkdir(parents=True, exist_ok=True)
+
+
+def output_path(path_value):
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
+
+def default_run_name(seed, future_mode, use_rafc, future_shift=0):
+    mode = str(future_mode)
+    if mode == "shift":
+        shift_tag = "p{}".format(int(future_shift)) if int(future_shift) >= 0 else "m{}".format(abs(int(future_shift)))
+        mode = "shift_{}".format(shift_tag)
+    policy_tag = "rafc" if use_rafc else "single"
+    return "multitask_{}_{}_td3bc_seed{}".format(mode, policy_tag, int(seed))
+
+
+def normalize_future_mode(value):
+    mode = str(value).strip().lower()
+    aliases = {
+        "null": "nofuture",
+        "none": "nofuture",
+        "generated": "gen",
+        "demo": "gt",
+        "groundtruth": "gt",
+        "ground_truth": "gt",
+        "temporal_shift": "shift",
+        "temporalshift": "shift",
+    }
+    return aliases.get(mode, mode)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="CALVIN BC-initialized RL fine-tuning")
+    parser.add_argument("--use_rafc", type=int, choices=[0, 1], default=int(os.environ.get("CALVIN_USE_RAFC", "0")))
+    parser.add_argument("--future_mode", choices=["nofuture", "gt", "gen", "shift"], default=normalize_future_mode(os.environ.get("CALVIN_FUTURE_MODE", "gen")))
+    parser.add_argument("--future_shift", type=int, choices=[-6, -4, -2, 0, 2, 4, 6], default=int(os.environ.get("CALVIN_FUTURE_SHIFT", "0")))
+    parser.add_argument("--seed", type=int, default=int(os.environ.get("CALVIN_SEED", "42")))
+    parser.add_argument("--max_episode_steps", type=int, default=int(os.environ.get("CALVIN_MAX_EPISODE_STEPS", "150")))
+    parser.add_argument("--save_gate_stats", type=int, choices=[0, 1], default=int(os.environ.get("CALVIN_SAVE_GATE_STATS", "0")))
+    parser.add_argument("--out_csv", default=os.environ.get("CALVIN_RL_OUT_CSV", "results/rl_train_eval.csv"))
+    return parser.parse_args()
+
+
+def configure_from_args(args):
+    global SEED, USE_RAFC, FUTURE_MODE, FUTURE_SHIFT, MAX_EPISODE_STEPS
+    global SAVE_GATE_STATS, OUT_CSV, RUN_NAME, RESULTS_DIR, FINAL_ACTOR_PATH
+    global BEST_ACTOR_PATH, HISTORY_JSON, USE_GENERATED_FUTURES_DURING_RL
+
+    SEED = int(args.seed)
+    USE_RAFC = bool(int(args.use_rafc))
+    FUTURE_MODE = str(args.future_mode).strip().lower()
+    FUTURE_SHIFT = int(args.future_shift)
+    MAX_EPISODE_STEPS = int(args.max_episode_steps)
+    SAVE_GATE_STATS = bool(int(args.save_gate_stats))
+    OUT_CSV = output_path(args.out_csv)
+    USE_GENERATED_FUTURES_DURING_RL = FUTURE_MODE in ("gen", "shift")
+
+    if "CALVIN_RL_RUN_NAME" not in os.environ:
+        RUN_NAME = default_run_name(SEED, FUTURE_MODE, USE_RAFC, FUTURE_SHIFT)
+    if "CALVIN_RL_RESULTS_DIR" not in os.environ:
+        RESULTS_DIR = RESULTS_ROOT / "rafc_rl_runs" / RUN_NAME
+    if "CALVIN_RL_FINAL_ACTOR_PATH" not in os.environ:
+        FINAL_ACTOR_PATH = RESULTS_DIR / "policy_final.pt"
+    if "CALVIN_RL_BEST_ACTOR_PATH" not in os.environ:
+        BEST_ACTOR_PATH = RESULTS_DIR / "policy_best.pt"
+    HISTORY_JSON = RESULTS_DIR / "history.json"
 
 
 def patch_yaml_tags_for_omegaconf():
@@ -761,6 +835,10 @@ class TD3FineTuningAgent(object):
             "arm_dim": self.arm_dim,
             "delta_arm_limit": DELTA_ARM_LIMIT,
             "grip_delta_limit": GRIP_DELTA_LIMIT,
+            "future_mode": FUTURE_MODE,
+            "future_shift": FUTURE_SHIFT,
+            "seed": SEED,
+            "max_episode_steps": MAX_EPISODE_STEPS,
         }
         if self.use_rafc:
             ckpt["gate_state_dict"] = self.gate.state_dict()
@@ -894,22 +972,40 @@ class CalvinFineTuningEnv(object):
         best_idx = int(np.clip(best_idx, seg_start, seg_end))
         return best_idx, float(best_dist if best_dist is not None else 0.0)
 
-    def _future_from_demo_or_video(self, aligned_idx):
-        task = self.current_segment["task"]
-        if USE_GENERATED_FUTURES_DURING_RL:
-            pth = GENERATED_FUTURE_ROOT / task / "inpainted_robot_future.mp4"
-            if pth.exists():
-                return read_video_frames(pth, self.base_policy.future_horizon, IMAGE_SIZE)
+    def _demo_future(self, aligned_idx):
         seg_end = int(self.current_segment["global_end_idx"])
         fut_idx = sample_future_indices(aligned_idx, seg_end, self.base_policy.future_horizon)
         return np.stack([resize_if_needed(np.asarray(self.cache.get(int(j))["rgb_static"], dtype=np.uint8), IMAGE_SIZE) for j in fut_idx], axis=0)
+
+    def _generated_future(self):
+        task = self.current_segment["task"]
+        pth = GENERATED_FUTURE_ROOT / task / "inpainted_robot_future.mp4"
+        if pth.exists():
+            return read_video_frames(pth, self.base_policy.future_horizon, IMAGE_SIZE)
+        return None
+
+    def _future_for_mode(self, aligned_idx):
+        current_static = np.asarray(self.obs_static_hist[-1], dtype=np.uint8)
+        if FUTURE_MODE == "nofuture":
+            return np.repeat(current_static[None, ...], repeats=self.base_policy.future_horizon, axis=0).astype(np.uint8)
+        if FUTURE_MODE == "gt":
+            future = self._demo_future(aligned_idx)
+        elif FUTURE_MODE in ("gen", "shift"):
+            future = self._generated_future()
+            if future is None:
+                future = self._demo_future(aligned_idx)
+        else:
+            raise ValueError("Unknown FUTURE_MODE: {}".format(FUTURE_MODE))
+        if FUTURE_MODE == "shift" or FUTURE_SHIFT != 0:
+            future = shift_future(future, FUTURE_SHIFT)
+        return np.asarray(future, dtype=np.uint8)
 
     def _policy_input(self, obs):
         robot = np.asarray(obs["robot_obs"], dtype=np.float32)
         scene = np.asarray(obs["scene_obs"], dtype=np.float32)
         aligned_idx, dist = self._nearest_progress_index(robot, scene)
         self.prev_raw_idx = aligned_idx
-        future_static = self._future_from_demo_or_video(aligned_idx)
+        future_static = self._future_for_mode(aligned_idx)
         return {
             "obs_static": np.stack(list(self.obs_static_hist), axis=0).astype(np.uint8),
             "obs_gripper": np.stack(list(self.obs_gripper_hist), axis=0).astype(np.uint8),
@@ -1046,11 +1142,15 @@ def extract_rafc_inputs(base_policy, pi):
 def eval_agent(env, base_policy, agent, num_eps):
     successes = 0
     rows = []
+    returns = []
+    gate_alphas = []
+    gate_weights = []
     for ep in range(num_eps):
         pi, info = env.reset(seed=SEED + 30_000 + ep)
         done = False
         trunc = False
         step = 0
+        episode_return = 0.0
         last = info
         while not done and not trunc:
             rafc = extract_rafc_inputs(base_policy, pi)
@@ -1065,17 +1165,55 @@ def eval_agent(env, base_policy, agent, num_eps):
                 return_gate=True,
             )
             base_action = gate_info["base_action"]
+            gate_alphas.append(float(gate_info["alpha"].mean()))
+            gate_weights.append(np.asarray(gate_info["weights"], dtype=np.float32))
             full_action = env._compose_full_action(base_action, delta)
-            pi, _, done, trunc, last = env.step(full_action, delta)
+            pi, reward, done, trunc, last = env.step(full_action, delta)
+            episode_return += float(reward)
             step += 1
             if pi is None:
                 break
         successes += int(bool(last.get("success", False)))
-        rows.append({"episode": ep + 1, "task": last.get("task", ""), "success": bool(last.get("success", False)), "steps": step})
-    return float(successes / max(num_eps, 1)), rows
+        returns.append(float(episode_return))
+        rows.append({"episode": ep + 1, "task": last.get("task", ""), "success": bool(last.get("success", False)), "steps": step, "return": float(episode_return)})
+    weights = np.mean(np.stack(gate_weights, axis=0), axis=0) if gate_weights else np.full((len(FUTURE_SHIFTS),), np.nan, dtype=np.float32)
+    gate_stats = {
+        "alpha": float(np.mean(gate_alphas)) if gate_alphas else np.nan,
+        "weights": [float(x) for x in weights],
+    }
+    return float(successes / max(num_eps, 1)), float(np.mean(returns)) if returns else 0.0, gate_stats, rows
+
+
+TRAIN_EVAL_COLUMNS = [
+    "task",
+    "future_mode",
+    "use_rafc",
+    "future_shift",
+    "seed",
+    "checkpoint_step",
+    "max_episode_steps",
+    "success_rate",
+    "mean_return",
+    "alpha",
+    "w_minus2",
+    "w_0",
+    "w_plus2",
+]
+
+
+def append_train_eval_csv(path, row):
+    ensure_dir(path.parent)
+    write_header = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TRAIN_EVAL_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in TRAIN_EVAL_COLUMNS})
 
 
 def main():
+    args = parse_args()
+    configure_from_args(args)
     set_seed(SEED)
     ensure_dir(RESULTS_DIR)
     if DATA_ROOT is None:
@@ -1099,7 +1237,7 @@ def main():
     priv_dim = int(pi["priv_state"].shape[0])
     replay = ReplayBuffer(BUFFER_SIZE, feature_dim, g_dim, priv_dim, ACTION_DIM, len(FUTURE_SHIFTS))
     agent = TD3FineTuningAgent(feature_dim, g_dim, priv_dim, ACTION_DIM, ARM_ACTION_DIM, DEVICE, use_rafc=USE_RAFC)
-    print("future_source={}".format("generated" if USE_GENERATED_FUTURES_DURING_RL else "demo"))
+    print("future_mode={} future_shift={} max_episode_steps={}".format(FUTURE_MODE, FUTURE_SHIFT, MAX_EPISODE_STEPS))
     print("use_rafc={} future_shifts={}".format(bool(USE_RAFC), list(FUTURE_SHIFTS)))
 
     first_reach = {
@@ -1108,7 +1246,17 @@ def main():
         "best_success": 0.0,
         "best_step": 0,
     }
-    history = {"evals": [], "first_reach": first_reach}
+    history = {
+        "config": {
+            "future_mode": FUTURE_MODE,
+            "future_shift": FUTURE_SHIFT,
+            "use_rafc": bool(USE_RAFC),
+            "seed": int(SEED),
+            "max_episode_steps": int(MAX_EPISODE_STEPS),
+        },
+        "evals": [],
+        "first_reach": first_reach,
+    }
     best_success = -1.0
     episode_reward = 0.0
     episode_steps = 0
@@ -1172,7 +1320,7 @@ def main():
             rafc = next_rafc
 
         if env_step % EVAL_EVERY_STEPS == 0:
-            rate, rows = eval_agent(eval_env, base_policy, agent, NUM_EVAL_EPISODES)
+            rate, mean_return, gate_stats, rows = eval_agent(eval_env, base_policy, agent, NUM_EVAL_EPISODES)
             success_percent = float(rate * 100.0)
             if first_reach["70"] is None and success_percent >= 70.0:
                 first_reach["70"] = int(env_step)
@@ -1185,6 +1333,8 @@ def main():
                 "env_step": env_step,
                 "success_rate": rate,
                 "success_percent": success_percent,
+                "mean_return": mean_return,
+                "gate_stats": gate_stats if SAVE_GATE_STATS and USE_RAFC else {},
                 "recent_success": float(np.mean(recent_success)) if len(recent_success) else 0.0,
                 "eval": rows,
                 "logs": logs,
@@ -1193,6 +1343,25 @@ def main():
             history["first_reach"] = first_reach
             with open(HISTORY_JSON, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
+            step_ckpt_path = RESULTS_DIR / "policy_step_{:06d}.pt".format(env_step)
+            agent.save(step_ckpt_path)
+            weights = gate_stats.get("weights", [])
+            csv_row = {
+                "task": "all",
+                "future_mode": FUTURE_MODE,
+                "use_rafc": int(bool(USE_RAFC)),
+                "future_shift": int(FUTURE_SHIFT),
+                "seed": int(SEED),
+                "checkpoint_step": int(env_step),
+                "max_episode_steps": int(MAX_EPISODE_STEPS),
+                "success_rate": rate,
+                "mean_return": mean_return,
+                "alpha": gate_stats.get("alpha", "") if SAVE_GATE_STATS and USE_RAFC else "",
+                "w_minus2": weights[0] if SAVE_GATE_STATS and USE_RAFC and len(weights) > 0 else "",
+                "w_0": weights[1] if SAVE_GATE_STATS and USE_RAFC and len(weights) > 1 else "",
+                "w_plus2": weights[2] if SAVE_GATE_STATS and USE_RAFC and len(weights) > 2 else "",
+            }
+            append_train_eval_csv(OUT_CSV, csv_row)
             print("eval step {} success {:.3f}".format(env_step, rate))
             if rate > best_success:
                 best_success = rate

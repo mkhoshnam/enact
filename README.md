@@ -118,6 +118,21 @@ For RAFC ablations, inference accepts simple environment switches:
     CALVIN_FUTURE_MODE=shift CALVIN_FUTURE_SHIFT=4 python scripts/calvin_infer_llm_future_bc_rl.py
     CALVIN_FUTURE_MODE=wrong CALVIN_WRONG_FUTURE_VIDEO_PATH=<wrong-future-video.mp4> python scripts/calvin_infer_llm_future_bc_rl.py
 
+### Reproducing paper results
+
+```bash
+# Table 2
+python scripts/calvin_infer_llm_future_bc_rl.py --eval_mode table2
+
+# Figure 4 and Table 3
+python scripts/calvin_infer_llm_future_bc_rl.py --eval_mode fig4_table3
+
+# Table 4
+python scripts/calvin_infer_llm_future_bc_rl.py --eval_mode table4
+```
+
+All CALVIN evaluations use `max_episode_steps=150`.
+
 ## Notes
 
 This is a simulation-based research-code release. It does not claim real-world transfer or full end-to-end scene reconstruction from raw sensory input.
