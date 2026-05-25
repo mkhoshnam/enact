@@ -42,6 +42,8 @@ The RoboCasa scripts, generated futures, and trained models are part of the same
       calvin_train_bc.py
       calvin_train_fine_tuning_rl.py
       calvin_infer_llm_future_bc_rl.py
+      SFP_training.py
+      SFP_test.py
 
 ## Supported CALVIN tasks
 
@@ -117,6 +119,11 @@ For RAFC ablations, inference accepts simple environment switches:
     CALVIN_FUTURE_MODE=null python scripts/calvin_infer_llm_future_bc_rl.py
     CALVIN_FUTURE_MODE=shift CALVIN_FUTURE_SHIFT=4 python scripts/calvin_infer_llm_future_bc_rl.py
     CALVIN_FUTURE_MODE=wrong CALVIN_WRONG_FUTURE_VIDEO_PATH=<wrong-future-video.mp4> python scripts/calvin_infer_llm_future_bc_rl.py
+
+Train and evaluate the SFP baseline:
+
+    python scripts/SFP_training.py
+    python scripts/SFP_test.py --task all --future_mode gen
 
 ### Reproducing paper results
 
