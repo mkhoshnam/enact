@@ -64,8 +64,8 @@ TRAIN_SPLIT = 0.90
 IMAGE_SIZE = None
 ARM_ACTION_DIM = 6
 ACTION_DIM = ARM_ACTION_DIM + 1
-MAX_EPISODE_STEPS = 150
-NUM_EPISODES = 3
+MAX_EPISODE_STEPS = 200
+NUM_EPISODES = 20
 VIDEO_FPS = 12
 FUTURE_SHIFTS = (-2, 0, 2)
 _EP_RE = re.compile(r"episode_(\d+)\.npz$")
@@ -395,7 +395,10 @@ class SFPFutureRunner(object):
         elif self.future_mode in ("gen", "shift"):
             future = self._generated_future()
             if future is None:
-                future = self._demo_future(start_idx)
+                raise FileNotFoundError(
+                    "Generated future is missing; GenFuture evaluation "
+                    "forbids demonstration fallback"
+                )
         else:
             raise ValueError("Unknown future mode: {}".format(self.future_mode))
         if self.future_mode == "shift" or self.future_shift != 0:

@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAIN_PATH = ROOT / "scripts" / "calvin_train_fine_tuning_rl.py"
 INFER_PATH = ROOT / "scripts" / "calvin_infer_llm_future_bc_rl.py"
 ORACLE_PATH = ROOT / "scripts" / "calvin_infer_gt_future_oracle.py"
+SFP_PATH = ROOT / "scripts" / "SFP_test.py"
 
 
 def source(path):
@@ -84,6 +85,27 @@ class VisualOnlyTrainingContractTests(unittest.TestCase):
         self.assertIn('os.environ.get("CALVIN_MAX_EPISODE_STEPS", "200")', self.text)
 
 
+class SFPInferenceContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = source(SFP_PATH)
+        cls.tree = ast.parse(cls.text)
+
+    def test_evaluation_defaults_match_the_paper(self):
+        self.assertIn("MAX_EPISODE_STEPS = 200", self.text)
+        self.assertIn("NUM_EPISODES = 20", self.text)
+
+    def test_generated_future_has_no_demo_fallback(self):
+        runner = class_node(self.tree, "SFPFutureRunner")
+        select_future = ast.get_source_segment(
+            self.text,
+            method_node(runner, "_select_future"),
+        )
+        self.assertIn("GenFuture evaluation", select_future)
+        self.assertIn("forbids demonstration fallback", select_future)
+        self.assertEqual(select_future.count("_demo_future(start_idx)"), 1)
+
+
 class VisualOnlyInferenceContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -103,6 +125,9 @@ class VisualOnlyInferenceContractTests(unittest.TestCase):
     def test_default_episode_length_is_200(self):
         self.assertIn("MAX_EPISODE_STEPS = 200", self.text)
         self.assertIn('os.environ.get("CALVIN_MAX_EPISODE_STEPS", "200")', self.text)
+
+    def test_default_evaluation_count_is_20(self):
+        self.assertIn('os.environ.get("CALVIN_NUM_EVAL_EPISODES", "20")', self.text)
 
 
 if __name__ == "__main__":
