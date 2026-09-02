@@ -8,137 +8,143 @@ Project page: https://enact2026.github.io/
 
 ## Overview
 
-ENACT uses an ontology-guided LLM reasoner to ground a user command, generate or select a short-horizon future video, and condition a robot policy on that future.
+The released CALVIN pipeline is:
 
-Pipeline:
+```text
+task command
+    -> ontology-guided task grounding
+    -> robot-free future-video generation and inpainting
+    -> future-conditioned visual transformer policy
+    -> BC initialization
+    -> sparse-reward TD3 fine-tuning
+```
 
-    task command
-    -> ontology-guided LLM task grounding
-    -> robot-free digital-twin future rollout
-    -> robot inpainting / generated future video
-    -> future-conditioned policy
-    -> BC and RL fine-tuning
+The RL actor and twin critics are visual-only. Their inputs are frozen visual-policy features, the future latent, the BC base action, and the residual action. Robot/scene state is used only to initialize a CALVIN benchmark episode; it is not stored in replay or passed to the actor or critics.
 
-## Current release
+The reward is sparse:
 
-This repository currently releases the CALVIN part of ENACT:
+```text
+step penalty + residual-action squared-L2 penalty
+             + success bonus OR timeout penalty
+```
 
-- CALVIN dataset construction
-- future-conditioned BC training
-- BC-initialized RL fine-tuning
-- ontology/LLM-guided inference
-- generated future video conditioning
-- reliability-aware future conditioning for generated, wrong, and shifted futures
+`oracle_success(...)` reads the CALVIN task oracle to produce the sparse success label. This is benchmark supervision and never enters the controller as an observation.
 
-The RoboCasa scripts, generated futures, and trained models are part of the same ENACT project and will be released soon.
+## Repository layout
 
-## Structure
+```text
+ontology/
+  calvin_task_ontology.json
+scripts/
+  calvin_build_bc_dataset.py
+  calvin_train_bc.py
+  calvin_train_fine_tuning_rl.py       # visual-only GenFuture/NoFuture RL
+  calvin_infer_llm_future_bc_rl.py     # visual-only evaluation
+  calvin_infer_gt_future_oracle.py     # explicitly labelled demo oracle
+  SFP_training.py
+  SFP_test.py
+```
 
-    ontology/
-      calvin_task_ontology.json
-
-    scripts/
-      calvin_build_bc_dataset.py
-      calvin_train_bc.py
-      calvin_train_fine_tuning_rl.py
-      calvin_infer_llm_future_bc_rl.py
-      SFP_training.py
-      SFP_test.py
-
-## Supported CALVIN tasks
-
-- open_drawer
-- close_drawer
-- push_into_drawer
-- turn_on_led
-- turn_off_led
-- turn_on_lightbulb
-- turn_off_lightbulb
-- move_slider_left
+The CALVIN release supports `open_drawer`, `close_drawer`, `push_into_drawer`, `turn_on_led`, `turn_off_led`, `turn_on_lightbulb`, `turn_off_lightbulb`, and `move_slider_left`.
 
 ## Setup
 
-Install CALVIN separately, then configure paths with environment variables:
-
-    export CALVIN_ROOT=<calvin-root>
-    export ENACT_CALVIN_OUT_BASE=<enact-calvin-outputs>
-    export CALVIN_GENERATED_FUTURE_ROOT=<generated-inpainted-calvin-futures>
-
-`CALVIN_DATA_ROOT`, `CALVIN_SEGMENTS_JSON`, `CALVIN_BC_CKPT_PATH`,
-`CALVIN_RESULTS_ROOT`, and `CALVIN_FINE_TUNING_ACTOR_PATH` can override
-individual inputs when needed. If `ENACT_CALVIN_OUT_BASE` is not set, scripts
-write to the repo-local `outputs/` directory.
-
-Install dependencies:
-
-    pip install -r requirements.txt
-
-For LLM task grounding:
-
-    export OPENAI_API_KEY=your_key_here
-
-Without an API key, inference falls back to ontology-based matching.
-
-## Usage
-
-Build dataset:
-
-    python scripts/calvin_build_bc_dataset.py
-
-Train BC:
-
-    python scripts/calvin_train_bc.py
-
-Fine-tune with RL:
-
-    python scripts/calvin_train_fine_tuning_rl.py
-
-By default the RL fine-tuning run is multitask and saves checkpoints under:
-
-    outputs/rafc_rl_runs/multitask_step6_rafc_td3bc_seed42/policy_best.pt
-    outputs/rafc_rl_runs/multitask_step6_rafc_td3bc_seed42/policy_final.pt
-
-Use generated futures and/or disable RAFC for baseline checkpoints:
-
-    CALVIN_USE_GENERATED_FUTURES_DURING_RL=1 python scripts/calvin_train_fine_tuning_rl.py
-    CALVIN_USE_RAFC=0 python scripts/calvin_train_fine_tuning_rl.py
-
-Headless CALVIN runs use EGL by default. Set `CALVIN_USE_EGL=0` when you need
-non-EGL rendering or GUI debugging.
-
-Run inference:
-
-    python scripts/calvin_infer_llm_future_bc_rl.py
-
-Example command:
-
-    turn on the green led
-
-For RAFC ablations, inference accepts simple environment switches:
-
-    CALVIN_FUTURE_MODE=null python scripts/calvin_infer_llm_future_bc_rl.py
-    CALVIN_FUTURE_MODE=shift CALVIN_FUTURE_SHIFT=4 python scripts/calvin_infer_llm_future_bc_rl.py
-    CALVIN_FUTURE_MODE=wrong CALVIN_WRONG_FUTURE_VIDEO_PATH=<wrong-future-video.mp4> python scripts/calvin_infer_llm_future_bc_rl.py
-
-Train and evaluate the SFP baseline:
-
-    python scripts/SFP_training.py
-    python scripts/SFP_test.py --task all --future_mode gen
-
-### Reproducing paper results
+Install CALVIN separately and use the same Python environment as that installation. Then install the additional dependencies and configure the paths:
 
 ```bash
-# Table 2
+pip install -r requirements.txt
+
+export CALVIN_ROOT=<calvin-root>
+export ENACT_CALVIN_OUT_BASE=<enact-calvin-outputs>
+export CALVIN_GENERATED_FUTURE_ROOT=<generated-inpainted-calvin-futures>
+```
+
+`CALVIN_DATA_ROOT`, `CALVIN_SEGMENTS_JSON`, `CALVIN_BC_CKPT_PATH`, `CALVIN_RESULTS_ROOT`, and `CALVIN_FINE_TUNING_ACTOR_PATH` can override individual inputs. Without `ENACT_CALVIN_OUT_BASE`, artifacts are written under the repo-local `outputs/` directory.
+
+For optional LLM task grounding, set `OPENAI_API_KEY`. Without it, inference uses deterministic ontology matching.
+
+## Training
+
+Build the BC dataset and train the visual transformer:
+
+```bash
+python scripts/calvin_build_bc_dataset.py
+python scripts/calvin_train_bc.py
+```
+
+Fine-tune on generated futures with the visual-only actor and critics:
+
+```bash
+python scripts/calvin_train_fine_tuning_rl.py \
+  --future_mode gen \
+  --use_rafc 0 \
+  --max_episode_steps 200
+```
+
+Other supported visual-only configurations are:
+
+```bash
+# Current observation repeated as a null future
+python scripts/calvin_train_fine_tuning_rl.py --future_mode nofuture
+
+# Generated future with a temporal shift and reliability-aware conditioning
+python scripts/calvin_train_fine_tuning_rl.py \
+  --future_mode shift --future_shift 4 --use_rafc 1
+```
+
+A requested generated future must exist. Training raises `FileNotFoundError` instead of silently substituting demonstration frames. `--future_mode gt` is also rejected by the training environment because GTFuture is an oracle evaluation condition, not a visual-only training mode.
+
+Headless CALVIN runs use EGL by default. Set `CALVIN_USE_EGL=0` for non-EGL rendering or GUI debugging.
+
+## Evaluation
+
+Run visual-only GenFuture or NoFuture evaluation:
+
+```bash
+python scripts/calvin_infer_llm_future_bc_rl.py \
+  --future_mode gen \
+  --max_episode_steps 200
+
+python scripts/calvin_infer_llm_future_bc_rl.py --future_mode nofuture
+```
+
+Missing generated video is a hard error at inference as well. There is no hidden demonstration fallback.
+
+Reproduce the visual-only portions of the paper tables:
+
+```bash
 python scripts/calvin_infer_llm_future_bc_rl.py --eval_mode table2
-
-# Figure 4 and Table 3
 python scripts/calvin_infer_llm_future_bc_rl.py --eval_mode fig4_table3
-
-# Table 4
 python scripts/calvin_infer_llm_future_bc_rl.py --eval_mode table4
 ```
 
-All CALVIN evaluations use `max_episode_steps=150`.
+### GTFuture oracle evaluation
+
+GTFuture reads held-out demonstration frames. It is isolated behind a clearly labelled entry point and its outputs use separate oracle filenames:
+
+```bash
+python scripts/calvin_infer_gt_future_oracle.py --eval_mode single
+python scripts/calvin_infer_gt_future_oracle.py --eval_mode table2
+python scripts/calvin_infer_gt_future_oracle.py --eval_mode fig4_table3
+```
+
+Do not report GTFuture as a deployable visual-only condition.
+
+## Reproducibility and compatibility
+
+Both training and inference default to 200 environment steps per episode. The scripts expose seeds, checkpoint paths, future modes, temporal shifts, and result CSV paths through command-line arguments.
+
+This revision changes the critic inputs, replay-buffer schema, and reward. Existing BC+RL and RAFC checkpoints were trained under the earlier privileged-critic/dense-reward setup and are not valid evidence for this formulation. Retrain all RL and RAFC runs before reporting new results. The frozen BC checkpoint remains the initialization.
+
+Run the lightweight source-contract and syntax checks with:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile \
+  scripts/calvin_train_fine_tuning_rl.py \
+  scripts/calvin_infer_llm_future_bc_rl.py \
+  scripts/calvin_infer_gt_future_oracle.py
+```
 
 ## Notes
 
@@ -146,9 +152,11 @@ This is a simulation-based research-code release. It does not claim real-world t
 
 ## Citation
 
-    @misc{khoshnazar2026enact,
-      title  = {LLM-Guided Future Hypotheses for Horizon-Aware Exploration in Multi-Step Robot Manipulation},
-      author = {Khoshnazar, Mohammad and Melnik, Andrew and Beetz, Michael},
-      year   = {2026},
-      url    = {https://enact2026.github.io/}
-    }
+```bibtex
+@misc{khoshnazar2026enact,
+  title  = {LLM-Guided Future Hypotheses for Horizon-Aware Exploration in Multi-Step Robot Manipulation},
+  author = {Khoshnazar, Mohammad and Melnik, Andrew and Beetz, Michael},
+  year   = {2026},
+  url    = {https://enact2026.github.io/}
+}
+```

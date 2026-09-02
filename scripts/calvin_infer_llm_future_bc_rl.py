@@ -90,6 +90,7 @@ FUTURE_SOURCE = os.environ.get("CALVIN_FUTURE_SOURCE", "generated").strip().lowe
 FUTURE_EVAL_MODE = os.environ.get("CALVIN_FUTURE_MODE", "gen").lower()
 FUTURE_EVAL_SHIFT = int(os.environ.get("CALVIN_FUTURE_SHIFT", "0"))
 WRONG_FUTURE_VIDEO_PATH = os.environ.get("CALVIN_WRONG_FUTURE_VIDEO_PATH", "")
+ALLOW_GT_ORACLE = os.environ.get("CALVIN_ALLOW_GT_ORACLE", "0") == "1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SHOW_GUI = True
@@ -97,7 +98,7 @@ SAVE_VIDEO = True
 VIDEO_FPS = 12
 IMAGE_SIZE = None
 NUM_EPISODES = int(os.environ.get("CALVIN_NUM_EVAL_EPISODES", "3"))
-MAX_EPISODE_STEPS = 150
+MAX_EPISODE_STEPS = 200
 ARM_ACTION_DIM = 6
 ACTION_DIM = ARM_ACTION_DIM + 1
 TRAIN_SPLIT = 0.90
@@ -156,7 +157,7 @@ def parse_args():
     parser.add_argument("--use_rafc", type=int, choices=[0, 1], default=int(os.environ.get("CALVIN_USE_RAFC", "0")))
     parser.add_argument("--future_shift", type=int, choices=[-6, -4, -2, 0, 2, 4, 6], default=int(os.environ.get("CALVIN_FUTURE_SHIFT", "0")))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("CALVIN_SEED", "42")))
-    parser.add_argument("--max_episode_steps", type=int, default=int(os.environ.get("CALVIN_MAX_EPISODE_STEPS", "150")))
+    parser.add_argument("--max_episode_steps", type=int, default=int(os.environ.get("CALVIN_MAX_EPISODE_STEPS", "200")))
     parser.add_argument("--task", default=os.environ.get("CALVIN_EVAL_TASK", ""))
     parser.add_argument("--command", default=os.environ.get("CALVIN_EVAL_COMMAND", ""))
     parser.add_argument("--checkpoint_step", type=int, default=int(os.environ.get("CALVIN_CHECKPOINT_STEP", "-1")))
@@ -860,6 +861,11 @@ class LLMFuturePolicyRunner(object):
         self.plan = plan
         self.task = plan["task_key"]
         self.future_mode = normalize_future_mode(FUTURE_EVAL_MODE if future_mode is None else future_mode)
+        if self.future_mode == "gt" and not ALLOW_GT_ORACLE:
+            raise ValueError(
+                "GTFuture is an oracle condition. Run "
+                "scripts/calvin_infer_gt_future_oracle.py instead."
+            )
         self.future_shift = FUTURE_EVAL_SHIFT if future_shift is None else int(future_shift)
         self.future_source = future_source_for_mode(self.future_mode)
         self.show_gui = SHOW_GUI if show_gui is None else bool(show_gui)
@@ -879,7 +885,6 @@ class LLMFuturePolicyRunner(object):
                 self.future_mode,
                 self.future_shift,
             )
-        self.warned_missing_generated = False
         self.future_static = None
 
     def _ensure_env(self):
@@ -907,11 +912,18 @@ class LLMFuturePolicyRunner(object):
         if self.future_source == "generated":
             if self.generated_future_static is not None:
                 return self.generated_future_static
-            if not self.warned_missing_generated:
-                print("[WARN] Generated future missing; falling back to demo future.")
-                self.warned_missing_generated = True
-            return apply_future_eval_mode(self._demo_future(start_idx), self.future_mode, self.future_shift)
+            raise FileNotFoundError(
+                "Generated future is missing; visual-only inference "
+                "forbids demonstration fallback: {}".format(
+                    self.future_path
+                )
+            )
         if self.future_source == "demo":
+            if not ALLOW_GT_ORACLE:
+                raise ValueError(
+                    "Demonstration futures are restricted to the explicitly "
+                    "labelled GTFuture oracle runner"
+                )
             return apply_future_eval_mode(self._demo_future(start_idx), self.future_mode, self.future_shift)
         if self.future_source == "null":
             return make_null_future_clip(init_static, self.base_policy.future_horizon)
@@ -1318,11 +1330,15 @@ def run_single(args, context, actor_cache):
 
 def run_table2(args, context, actor_cache):
     rows = []
-    settings = [
-        ("GTFuture", "gt", False),
-        ("GenFuture", "gen", False),
-        ("GenFuture+RAFC", "gen", True),
-    ]
+    if ALLOW_GT_ORACLE:
+        settings = [("GTFuture (oracle)", "gt", False)]
+        output_file = "results/table2_gt_oracle_temporal_shift.csv"
+    else:
+        settings = [
+            ("GenFuture", "gen", False),
+            ("GenFuture+RAFC", "gen", True),
+        ]
+        output_file = "results/table2_visual_temporal_shift.csv"
     for condition, future_mode, use_rafc in settings:
         for future_shift in [-6, -4, -2, 0, 2, 4, 6]:
             for task in context["tasks"]:
@@ -1342,13 +1358,14 @@ def run_table2(args, context, actor_cache):
                     row["condition"] = condition
                     rows.append(row)
                     print("table2 {} shift={} task={} seed={} success={:.3f}".format(condition, future_shift, task, seed, row["success_rate"]))
-    out_path = write_csv_rows("results/table2_temporal_shift.csv", TABLE_COLUMNS, rows)
+    out_path = write_csv_rows(output_file, TABLE_COLUMNS, rows)
     print("saved:", out_path)
 
 
 def run_fig4_table3(args, context, actor_cache):
     rows = []
-    for future_mode in ["nofuture", "gt", "gen"]:
+    future_modes = ["gt"] if ALLOW_GT_ORACLE else ["nofuture", "gen"]
+    for future_mode in future_modes:
         for checkpoint_step in [0, 30000, 60000, 90000, 120000, 140000]:
             for task in context["tasks"]:
                 for seed in [42, 43, 44]:
@@ -1367,8 +1384,14 @@ def run_fig4_table3(args, context, actor_cache):
                     row["condition"] = "Fig4/Table3"
                     rows.append(row)
                     print("fig4 future={} ckpt={} task={} seed={} success={:.3f}".format(future_mode, checkpoint_step, task, seed, row["success_rate"]))
-    out_path = write_csv_rows("results/fig4_table3_learning_curve.csv", TABLE_COLUMNS, rows)
-    img_path = write_learning_curve_png(rows, "img/ex_rl_full.png")
+    if ALLOW_GT_ORACLE:
+        output_csv = "results/fig4_table3_gt_oracle_learning_curve.csv"
+        output_image = "img/ex_rl_gt_oracle.png"
+    else:
+        output_csv = "results/fig4_table3_visual_learning_curve.csv"
+        output_image = "img/ex_rl_visual.png"
+    out_path = write_csv_rows(output_csv, TABLE_COLUMNS, rows)
+    img_path = write_learning_curve_png(rows, output_image)
     print("saved:", out_path)
     print("saved:", img_path)
 
